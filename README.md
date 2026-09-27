@@ -25,7 +25,7 @@ rebuilt for it: precise, perspective-correct and spread over both CPU cores. Thi
 - Music with the GOG file names, as they come (no renaming), including the cutscene audio
 - A full PS1-style control scheme adapted to the Miyoo Mini Plus buttons
 - Quick save and quick load shortcuts
-- Frame rate capped at 60 FPS, the screen's refresh rate
+- 45 to 60 FPS
 
 ## Installation
 
