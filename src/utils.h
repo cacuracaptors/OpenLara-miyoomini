@@ -1874,7 +1874,15 @@ private:
         }
 
     #ifdef _OS_LINUX
-        strcat(path, osFixFileName(name));
+        // osFixFileName() returns NULL for files that do not exist (see
+        // exists() below). Passing that straight to strcat() crashed the
+        // game whenever an optional asset was missing, e.g. the intro FMV on
+        // "New Game". Fall back to the name as given: the open below then
+        // simply fails, which the callers already handle.
+        {
+            const char *fixedName = osFixFileName(name);
+            strcat(path, fixedName ? fixedName : name);
+        }
     #else
         strcat(path, name);
     #endif

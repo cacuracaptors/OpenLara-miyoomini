@@ -257,14 +257,14 @@ struct Controller {
         //    return;
 
         TR::Room::Sector *sBelow = &s;
-        while (sBelow->roomBelow != TR::NO_ROOM) sBelow = &level->getSector(sBelow->roomBelow, x, z, dx, dz);
+        while (sBelow->roomBelow != TR::NO_ROOM && !level->isSolidFloorTriangle(sBelow, x, z)) sBelow = &level->getSector(sBelow->roomBelow, x, z, dx, dz);
         info.floor = float(256 * sBelow->floor);
 
         parseFloorData(info, sBelow->floorIndex, dx, dz);
 
         if (info.roomNext == TR::NO_ROOM) {
             TR::Room::Sector *sAbove = &s;
-            while (sAbove->roomAbove != TR::NO_ROOM) sAbove = &level->getSector(sAbove->roomAbove, x, z, dx, dz);
+            while (sAbove->roomAbove != TR::NO_ROOM && !level->isSolidCeilingTriangle(sAbove, x, z)) sAbove = &level->getSector(sAbove->roomAbove, x, z, dx, dz);
             if (sAbove != sBelow) {
                 TR::Level::FloorInfo tmpInfo;
                 tmpInfo.ceiling = float(256 * sAbove->ceiling);
@@ -1455,6 +1455,23 @@ struct Controller {
         Color32 color(ambient, ambient, ambient, alpha);
 
         vec3 p = pos - Core::viewPos.xyz();
+
+    #ifdef FFP
+        // Effect sprites are queued relative to the camera, and the queue can
+        // be flushed right here (tile change, full buffer). Upstream only told
+        // the shader where the camera is (setBasis); fixed-function renderers
+        // use mModel, which still held the last model drawn, so bubbles,
+        // sparks, blood and splashes were drawn off-screen. Models drawn since
+        // the last sprite may also have changed the bound tile.
+        {
+            MeshBuilder *m = game->getMesh();
+            Core::mModel.identity();
+            Core::mModel.setPos(Core::viewPos.xyz());
+            if (m->dynICount && m->curTile != 0xFFFF) {
+                m->atlas->bindTile(m->curTile, m->curClut);
+            }
+        }
+    #endif
 
         game->getMesh()->addDynSprite(level->spriteSequences[-(getEntity().modelIndex + 1)].sStart + frame, short3(int16(p.x), int16(p.y), int16(p.z)), false, false, color, color);
     }

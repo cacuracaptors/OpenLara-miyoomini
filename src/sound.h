@@ -698,9 +698,13 @@ namespace Sound {
     struct MP3 : Decoder {
         mp3_decoder_t   mp3;
         char    *buffer;
-        int     size, pos;        
+        int     size, pos;
+        // One decoded MP3 frame (up to 1152 samples per channel), kept
+        // between calls - see decode()
+        int16   pcm[1152 * 2];
+        int     pcmPos, pcmCount;   // in stereo frames
 
-        MP3(Stream *stream, int channels) : Decoder(stream, channels, 0), size(stream->size), pos(0) {
+        MP3(Stream *stream, int channels) : Decoder(stream, channels, 0), size(stream->size), pos(0), pcmPos(0), pcmCount(0) {
             mp3 = mp3_create();
             buffer = new char[size]; // TODO: file streaming
             stream->raw(buffer, size);
@@ -712,25 +716,45 @@ namespace Sound {
         }
 
         virtual int decode(Frame *frames, int count) {
-            mp3_info_t info;
-            int i = 0;
-            char *ptr = (char*)frames;
-            while (ptr < (char*)&frames[count]) {
-                int res = mp3_decode(mp3, buffer + pos, size - pos, (short*)ptr, &info);
-                if (res) {
+            // Upstream decoded whole MP3 frames (1152 samples) straight into
+            // the output until it was full - overrunning it and throwing away
+            // the rest of the last frame - and the next call resumed at the
+            // following frame. Music skipped a piece at every call (a click
+            // every 512 samples here) and ran out early. It also returned
+            // bytes instead of frames. Keep the leftover, hand out exactly
+            // what was asked for, and count in frames like the other decoders.
+            int done = 0;
+            while (done < count) {
+                if (pcmPos >= pcmCount) {
+                    mp3_info_t info;
+                    int res = mp3_decode(mp3, buffer + pos, size - pos, (short*)pcm, &info);
+                    if (!res) break;
                     pos += res;
-                    ptr += info.audio_bytes;
-                    i   += info.audio_bytes;
-                } else
-                    break;
+                    pcmPos = 0;
+                    int ch = info.channels > 0 ? info.channels : 2;
+                    pcmCount = info.audio_bytes / (2 * ch);
+                    if (ch == 1) { // mono: widen to stereo in place, back to front
+                        for (int i = pcmCount - 1; i >= 0; i--) {
+                            pcm[i * 2 + 1] = pcm[i];
+                            pcm[i * 2 + 0] = pcm[i];
+                        }
+                    }
+                    continue;
+                }
+                int n = pcmCount - pcmPos;
+                if (n > count - done) n = count - done;
+                memcpy(&frames[done], &pcm[pcmPos * 2], n * sizeof(Frame));
+                pcmPos += n;
+                done   += n;
             }
-            return i;
+            return done;
         }
 
         virtual void replay() {
             mp3_done(mp3);
             mp3 = mp3_create();
             pos = 0;
+            pcmPos = pcmCount = 0;
         }
     };
 #endif
@@ -802,7 +826,7 @@ namespace Sound {
             ogg = stb_vorbis_open_memory(data, stream->size, NULL, &alloc);
             ASSERT(ogg);
             stb_vorbis_info info = stb_vorbis_get_info(ogg);
-            this->channels = info.channels;
+            this->channels = 2;   // decode() always asks stb_vorbis for stereo
             this->freq     = info.sample_rate;
         }
 
@@ -814,9 +838,15 @@ namespace Sound {
 
         virtual int decode(Frame *frames, int count) {
             PROFILE_CPU_TIMING(stats.ogg);
+            // stb_vorbis returns samples per channel, i.e. whole stereo frames.
+            // Upstream advanced the output by 'i' shorts rather than 'i' frames,
+            // so every call after the first overwrote half of the previous one
+            // (clicks and garbled music, like the MP3 decoder had). It also
+            // passed the file's own channel count, so a mono track came out in
+            // the wrong layout; ask for stereo and let stb_vorbis convert.
             int i = 0;
             while (i < count) {
-                int res = stb_vorbis_get_samples_short_interleaved(ogg, channels, (short*)frames + i, (count - i) * 2);
+                int res = stb_vorbis_get_samples_short_interleaved(ogg, 2, (short*)(frames + i), (count - i) * 2);
                 if (!res) break;
                 i += res;
             }

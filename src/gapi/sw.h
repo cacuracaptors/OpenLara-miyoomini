@@ -1,3 +1,9 @@
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
+#include <sched.h>
+#include <pthread.h>
+#include <sys/time.h>
 #ifndef H_GAPI_SW
 #define H_GAPI_SW
 
@@ -9,7 +15,8 @@
 
 //#define DITHER_FILTER
 
-#if defined(_OS_LINUX) || defined(_OS_TNS)
+// Miyoo Mini: render straight into the 32-bit screen surface
+#if (defined(_OS_LINUX) || defined(_OS_TNS)) && !defined(__MIYOO__)
     #define COLOR_16
 #endif
 
@@ -40,6 +47,12 @@ namespace GAPI {
     #else
         typedef uint32 ColorSW;
     #endif
+    // Depth buffer holds 1/w as a float: its precision is relative at any
+    // distance. The original 16-bit z packed most of its precision next to
+    // the camera, so close surfaces (Lara's hair and face) z-fought.
+    // 16-bit: 1/w * 2^21 (resolution ~0.5 units at 1024 units away). Half
+    // the memory traffic of the float buffer, which mattered: this device's
+    // memory is slow and both cores share it.
     typedef uint16 DepthSW;
 
     uint8   *swLightmap;
@@ -71,6 +84,8 @@ namespace GAPI {
     };
 
 // Texture
+    void swDrain();
+
     struct Texture {
         uint8      *memory;
         int        width, height, origWidth, origHeight;
@@ -86,11 +101,28 @@ namespace GAPI {
 
             memory = new uint8[width * height * 4];
             if (data) {
-                update(data);
+                // Two conventions reach this point. Texture::Load creates the
+                // texture at its power-of-two size with padded pixels (and fixes
+                // origWidth afterwards): copy the whole block. Other callers -
+                // the FMV player among them - create it at the image's real size,
+                // which the wrapper then rounds up, and pass tightly packed
+                // pixels: copy row by row and clear the padding. Copying the
+                // whole block there read past the end of the caller's pixels,
+                // which crashed on TR2's videos.
+                if (origWidth == width && origHeight == height) {
+                    memcpy(memory, data, width * height * 4);
+                } else {
+                    memset(memory, 0, width * height * 4);
+                    const uint8 *src = (const uint8*)data;
+                    for (int y = 0; y < origHeight; y++) {
+                        memcpy(memory + y * width * 4, src + y * origWidth * 4, origWidth * 4);
+                    }
+                }
             }
         }
 
         void deinit() {
+            swDrain();   // the pending frame may still be reading this texture
             if (memory) {
                 delete[] memory;
             }
@@ -99,7 +131,15 @@ namespace GAPI {
         void generateMipMap() {}
 
         void update(void *data) {
-            memcpy(memory, data, width * height * 4);
+            // Match the GL backend (glTexSubImage2D over origWidth x origHeight):
+            // callers such as the FMV player pass tightly packed pixels of the
+            // image's real size, while the texture itself is rounded up to a
+            // power of two. Copying the whole texture in one block skewed every
+            // row (and read past the end of the frame), scrambling the videos.
+            const uint8 *src = (const uint8*)data;
+            for (int y = 0; y < origHeight; y++) {
+                memcpy(memory + y * width * 4, src + y * origWidth * 4, origWidth * 4);
+            }
         }
 
         void bind(int sampler) {
@@ -173,57 +213,77 @@ namespace GAPI {
 
     ColorSW *swColor;
     DepthSW *swDepth;
+    // Mirrors of the core's depth test/write state. The z-buffer below was
+    // commented out upstream (likely for speed on weaker targets), which
+    // left 3D objects overlapping in draw order instead of by distance.
+    bool swDepthTest  = true;
+    bool swDepthWrite = true;
+    // Set by transform() when every vertex of the batch has w == 1, i.e. an
+    // orthographic 2D batch (UI text, bars). Those draw over the scene.
+    bool swOrthoBatch = false;
+    // Light level and palette folded into one table: the shaded colour for
+    // (light level, palette index). Saves a dependent lookup per pixel and
+    // fits in the L1 cache (16 KB). Rebuilt once per frame, on clear().
+    bool    swShadeDirty = true;
+    // Set by the level each frame. The DOS game tinted its palette when the
+    // camera was underwater; the GL renderer does it in a shader. Here the
+    // tint is baked into swShade, so it costs nothing per pixel.
+    bool    swUnderwater = false;
+    bool    swBatchWater = false;  // this batch: camera underwater, or geometry in a water room
+    bool    swSkyBatch   = false;  // drawing the TR2/TR3 sky: no fog, no far clipping
+    float   swWaterTime  = 0.0f;   // seconds, set by the level each frame
+    // 2D primitive whose UVs all point at one texel (the white sprite used
+    // by frames, backgrounds and bars): fill it with its colour directly.
+    bool    swSolidPrim  = false;
+
+    // Frame timing: balances the work between the two cores, and feeds the
+    // periodic perf line in the log.
+    long long swPerfRaster = 0, swPerfPixels = 0;
+    static inline long long swPerfNow() {
+        timeval t;
+        gettimeofday(&t, NULL);
+        return (long long)t.tv_sec * 1000000 + t.tv_usec;
+    }
     short4  swClipRect;
 
     struct VertexSW {
         int32 x, y, z, w;
         int32 u, v, l;
+        // u/w, v/w and 1/w: these interpolate linearly across the screen,
+        // which is what perspective-correct texturing needs (see drawLine)
+        float pu, pv, pq;
+        float fx, fy;   // exact projected position, used by the rasterizer
+        uint32 color;   // vertex colour RGBA, used by 2D (UI) batches
 
         inline VertexSW operator + (const VertexSW &p) const {
             VertexSW ret;
-            ret.x = x + p.x;
-            ret.y = y;
-            ret.z = z + p.z;
-            ret.w = w + p.w;
-            ret.u = u + p.u;
-            ret.v = v + p.v;
-            ret.l = l + p.l;
+            ret.x = x + p.x; ret.y = y; ret.z = z + p.z; ret.w = w + p.w;
+            ret.u = u + p.u; ret.v = v + p.v; ret.l = l + p.l;
+            ret.pu = pu + p.pu; ret.pv = pv + p.pv; ret.pq = pq + p.pq;
             return ret;
         }
 
         inline VertexSW operator - (const VertexSW &p) const {
             VertexSW ret;
-            ret.x = x - p.x;
-            ret.y = y;
-            ret.z = z - p.z;
-            ret.w = w - p.w;
-            ret.u = u - p.u;
-            ret.v = v - p.v;
-            ret.l = l - p.l;
+            ret.x = x - p.x; ret.y = y; ret.z = z - p.z; ret.w = w - p.w;
+            ret.u = u - p.u; ret.v = v - p.v; ret.l = l - p.l;
+            ret.pu = pu - p.pu; ret.pv = pv - p.pv; ret.pq = pq - p.pq;
             return ret;
         }
 
         inline VertexSW operator * (const int32 s) const {
             VertexSW ret;
-            ret.x = x * s;
-            ret.y = y;
-            ret.z = z * s;
-            ret.w = w * s;
-            ret.u = u * s;
-            ret.v = v * s;
-            ret.l = l * s;
+            ret.x = x * s; ret.y = y; ret.z = z * s; ret.w = w * s;
+            ret.u = u * s; ret.v = v * s; ret.l = l * s;
+            ret.pu = pu * float(s); ret.pv = pv * float(s); ret.pq = pq * float(s);
             return ret;
         }
 
         inline VertexSW operator / (const int32 s) const {
             VertexSW ret;
-            ret.x = x / s;
-            ret.y = y;
-            ret.z = z / s;
-            ret.w = w / s;
-            ret.u = u / s;
-            ret.v = v / s;
-            ret.l = l / s;
+            ret.x = x / s; ret.y = y; ret.z = z / s; ret.w = w / s;
+            ret.u = u / s; ret.v = v / s; ret.l = l / s;
+            ret.pu = pu / float(s); ret.pv = pv / float(s); ret.pq = pq / float(s);
             return ret;
         }
     };
@@ -249,7 +309,7 @@ namespace GAPI {
 
     void resize() {
         delete[] swDepth;
-        //swDepth = new DepthSW[Core::width * Core::height];
+        swDepth = new DepthSW[Core::width * Core::height];
     }
 
     inline mat4::ProjRange getProjRange() {
@@ -286,13 +346,21 @@ namespace GAPI {
 
     void waitVBlank() {}
 
+    void clearImpl(bool color, bool depth);
+    void swRecordClear(bool color, bool depth);
     void clear(bool color, bool depth) {
+        swShadeDirty = true;
+        swRecordClear(color, depth);
+    }
+    void clearImpl(bool color, bool depth) {
         if (color) {
             memset(swColor, 0x00, Core::width * Core::height * sizeof(ColorSW));
         }
 
         if (depth) {
-            //memset(swDepth, 0xFF, Core::width * Core::height * sizeof(DepthSW));
+            if (swDepth) {
+                memset(swDepth, 0, Core::width * Core::height * sizeof(DepthSW)); // 1/w = 0: infinitely far
+            }
         }
     }
 
@@ -307,9 +375,13 @@ namespace GAPI {
         swClipRect.w = Core::active.viewport.w - s.y;
     }
 
-    void setDepthTest(bool enable) {}
+    void setDepthTest(bool enable) {
+        swDepthTest = enable;
+    }
 
-    void setDepthWrite(bool enable) {}
+    void setDepthWrite(bool enable) {
+        swDepthWrite = enable;
+    }
 
     void setColorWrite(bool r, bool g, bool b, bool a) {}
 
@@ -340,8 +412,11 @@ namespace GAPI {
     void setFog(const vec4 &params) {}
 
     bool checkBackface(const VertexSW *a, const VertexSW *b, const VertexSW *c) {
-        return ((b->x - a->x) >> 16) * (c->y - a->y) -
-               ((c->x - a->x) >> 16) * (b->y - a->y) <= 0;
+        // Use the exact projected positions. Upstream rounded x and y to whole
+        // pixels first, so thin triangles (Lara's braid, fingers, far details)
+        // came out with zero or even flipped area and were thrown away.
+        return (b->fx - a->fx) * (c->fy - a->fy) -
+               (c->fx - a->fx) * (b->fy - a->fy) <= 0.0f;
     }
 
     inline void sortVertices(VertexSW *&t, VertexSW *&m, VertexSW *&b) {
@@ -363,6 +438,9 @@ namespace GAPI {
         v.u += d.u;
         v.v += d.v;
         v.l += d.l;
+        v.pu += d.pu;
+        v.pv += d.pv;
+        v.pq += d.pq;
     }
 
     inline void step(VertexSW &v, const VertexSW &d, int32 count) {
@@ -370,6 +448,9 @@ namespace GAPI {
         v.u += d.u * count;
         v.v += d.v * count;
         v.l += d.l * count;
+        v.pu += d.pu * float(count);
+        v.pv += d.pv * float(count);
+        v.pq += d.pq * float(count);
     }
 
     // https://www.flipcode.com/archives/Texturing_As_In_Unreal.shtml
@@ -402,21 +483,63 @@ namespace GAPI {
         const int *dithY = uvDither + ((y & 1) * 4);
     #endif
 
+        // Perspective-correct texturing. Upstream interpolated u/v linearly
+        // in screen space (affine, like the PS1), which warped textures on
+        // surfaces close to the camera. u/w, v/w and 1/w do interpolate
+        // linearly on screen: recover the exact u/v every SW_PERSP_SPAN
+        // pixels (one division each) and step linearly in between.
+        #define SW_PERSP_SPAN 16
+        float curPU = S.pu;
+        float curPV = S.pv;
+        float curPQ = S.pq;
+        int32 endU  = int32(curPU / curPQ);
+        int32 endV  = int32(curPV / curPQ);
+        int32 texU  = endU, texV = endV;
+        int32 texDU = 0, texDV = 0;
+        int   spanLeft = 0;
+
         for (int x = i + x1; x < i + x2; x++) {
             S.z += dS.z;
 
-            DepthSW z = DepthSW(uint32(S.z) >> 16);
+            if (spanLeft == 0) {
+                // Never step past the end of the scanline: extrapolating 1/w
+                // beyond the polygon on steep surfaces gave wild u/v values,
+                // which landed on transparent texels and left see-through holes.
+                int len = (i + x2) - x;
+                if (len > SW_PERSP_SPAN) len = SW_PERSP_SPAN;
+                texU = endU;
+                texV = endV;
+                curPU += dS.pu * float(len);
+                curPV += dS.pv * float(len);
+                curPQ += dS.pq * float(len);
+                if (curPQ < 1e-6f) curPQ = 1e-6f;
+                endU = int32(curPU / curPQ);
+                endV = int32(curPV / curPQ);
+                texDU = (endU - texU) / len;
+                texDV = (endV - texV) / len;
+                spanLeft = len;
+            }
+            const int32 pixU = texU;
+            const int32 pixV = texV;
+            texU += texDU;
+            texV += texDV;
+            spanLeft--;
 
-            {//if (swDepth[x] >= z) {
+            DepthSW z = S.pq; // 1/w: larger means closer
+
+            if (!swDepth || !swDepthTest || z >= swDepth[x]) {
             #ifdef DITHER_FILTER
                 const int *dithX = dithY + (x & 1);
 
-                uint32 u = uint32(S.u + dithX[0]) >> 16;
-                uint32 v = uint32(S.v + dithX[2]) >> 16;
+                int32 u = (pixU + dithX[0]) >> 16;
+                int32 v = (pixV + dithX[2]) >> 16;
             #else
-                uint32 u = uint32(S.u) >> 16;
-                uint32 v = uint32(S.v) >> 16;
+                int32 u = pixU >> 16;
+                int32 v = pixV >> 16;
             #endif
+                // the division can land a hair outside the texture at edges
+                if (u < 0) u = 0; else if (u > 255) u = 255;
+                if (v < 0) v = 0; else if (v > 255) v = 255;
 
                 uint8 index = curTile->index[(v << 8) + u];
 
@@ -424,7 +547,9 @@ namespace GAPI {
                     index = swLightmap[((S.l >> (16 + 3)) << 8) + index];
 
                     swColor[x] = swPalette[index];
-                    //swDepth[x] = z;
+                    if (swDepth && swDepthWrite) {
+                        swDepth[x] = z;
+                    }
                 }
             }
 
@@ -472,126 +597,735 @@ namespace GAPI {
         }
     }
 
-    void drawTriangle(Index *indices) {
-    /*
-             t
-            /\ <----- top triangle
-         m /__\/ n
-           \  /\
-             \  \ <-- bottom triangle
-               \ \
-                 \\
-                   \
-                    b
-    */
-        VertexSW _n;
-        VertexSW *t = swVertices.items + indices[0];
-        VertexSW *m = swVertices.items + indices[1];
-        VertexSW *b = swVertices.items + indices[2];
-        VertexSW *n = &_n;
+    // ---- Triangle scan conversion ----------------------------------------
+    // Upstream walked triangle edges from vertices rounded to whole scanlines,
+    // with no sub-pixel correction, and split quads with integer divisions.
+    // Neighbouring triangles then disagreed about which pixels they owned:
+    // seams opened and closed as the camera moved (PS1-style cracks) and the
+    // surfaces behind leaked through them. Here every pixel is sampled at its
+    // centre against edges computed from the exact projected positions; each
+    // edge is always evaluated top-to-bottom from the same two vertices, so
+    // triangles sharing it get bit-identical results; and the interpolants
+    // come from per-triangle plane equations instead of accumulated steps.
+    #ifndef SW_PERSP_SPAN
+    #define SW_PERSP_SPAN 16
+    #endif
 
-        if (checkBackface(t, m, b))
-            return;
+    struct PlaneSW {
+        float dx, dy, c;
+    };
 
-        int32 cx1 = swClipRect.x << 16;
-        int32 cx2 = swClipRect.z << 16;
+    static inline void planeSW(PlaneSW &p, const VertexSW *a, const VertexSW *b, const VertexSW *c,
+                               float va, float vb, float vc, float invArea) {
+        float x1 = b->fx - a->fx;
+        float y1 = b->fy - a->fy;
+        float x2 = c->fx - a->fx;
+        float y2 = c->fy - a->fy;
+        float d1 = vb - va;
+        float d2 = vc - va;
+        p.dx = (d1 * y2 - d2 * y1) * invArea;
+        p.dy = (d2 * x1 - d1 * x2) * invArea;
+        p.c  = va - p.dx * a->fx - p.dy * a->fy;
+    }
 
-        if (t->x < cx1 && m->x < cx1 && b->x < cx1)
-            return;
+    static inline float edgeXSW(const VertexSW *top, const VertexSW *bottom, float y) {
+        float dy = bottom->fy - top->fy;
+        if (dy <= 0.0f) return top->fx;
+        return top->fx + (bottom->fx - top->fx) * ((y - top->fy) / dy);
+    }
 
-        if (t->x > cx2 && m->x > cx2 && b->x > cx2)
-            return;
+    static inline ColorSW tintSW(ColorSW c, int kr, int kg, int kb) { // k: 0..256
+        int r = (((c >> 16) & 0xFF) * kr) >> 8;
+        int g = (((c >>  8) & 0xFF) * kg) >> 8;
+        int b = (( c        & 0xFF) * kb) >> 8;
+        return ColorSW(0xFF000000u | (r << 16) | (g << 8) | b);
+    }
 
-        sortVertices(t, m, b);
+    // ---- Pipelined, two-core rasterization ------------------------------
+    // Each DIP call's projected vertices and visible triangles are recorded
+    // (with clears and the 2D background blit) into a frame list. As soon as a
+    // frame is recorded, the second core starts rasterizing it, while the main
+    // core goes on to update the game and record the next frame; then the main
+    // core rasterizes its own part of the pending frame. The screen is split
+    // into 8-line groups shared between the cores in a ratio that adapts every
+    // frame so both finish together. Frames go to two alternating buffers,
+    // stored rotated 180 degrees for the upside-down panel (logical pixel
+    // (x, y) at end - (y * width + x)), which the platform copies to the
+    // screen in the background. Costs one frame of latency.
 
-        if (b->y < swClipRect.y || t->y > swClipRect.w)
-            return;
+    #define SW_BAND_SHIFT 3
+    #define SW_GROUPS     64
 
-        *n = ((*b - *t) / (b->y - t->y) * (m->y - t->y)) + *t;
-        n->y = m->y;
+    enum { SW_CMD_CLEAR, SW_CMD_TRIS, SW_CMD_BLIT };
 
-        if (m->x > n->x) {
-            swap(m, n);
+    struct CmdSW {
+        int          type;
+        bool         color, depth;                         // clear
+        const uint8 *texels;                               // triangles
+        Texture     *tex;                                  // triangles, blit
+        bool         affine, ortho, testZ, writeZ;
+        bool         water;                                // triangles: use the underwater palette
+        short4       clip;
+        int          triStart, triCount;
+        int          sx0, sy0, sw, sh, ox0, oy0, ow, oh;   // blit
+    };
+
+    struct TriSW {
+        const VertexSW *a, *b, *c;
+    };
+
+    #define SW_MAX_CMDS  8192
+    #define SW_MAX_TRIS  (96 * 1024)
+    #define SW_MAX_VERTS (128 * 1024)
+
+    struct FrameSW {
+        CmdSW    *cmds;
+        TriSW    *tris;
+        VertexSW *verts;
+        int       cmdCount, triCount, vertCount;
+        bool      overflow;
+        ColorSW  *buffer;
+        ColorSW  *colorEnd;
+        uint8     owner[SW_GROUPS];      // 1: the worker core draws this group
+        uint8     lightSel[32 * 256];
+        ColorSW   palWorld[256];         // scene palette
+        ColorSW   palWater[256];         // scene palette with the underwater tint
+        ColorSW   palUI[256];
+    };
+
+    FrameSW  swFrames[2];
+    FrameSW *swRec  = NULL;   // being recorded
+    FrameSW *swPend = NULL;   // recorded, being rasterized
+    ColorSW *swBuffers[2] = { NULL, NULL };
+    int      swNextBuffer = 0;
+    void   (*swPresent)(const ColorSW *buffer) = NULL;   // set by the platform
+    int      swWorkerGroups = 36;
+    long long swLaunchTime  = 0;   // when the worker got the pending frame
+
+    const VertexSW *swBatchBase = NULL;
+    CmdSW          *swBatch = NULL;
+
+    static void swInitFrames() {
+        if (swRec) return;
+        for (int i = 0; i < 2; i++) {
+            FrameSW &f = swFrames[i];
+            f.cmds  = new CmdSW[SW_MAX_CMDS];
+            f.tris  = new TriSW[SW_MAX_TRIS];
+            f.verts = new VertexSW[SW_MAX_VERTS];
+            f.cmdCount = f.triCount = f.vertCount = 0;
+            f.overflow = false;
+            f.buffer = f.colorEnd = NULL;
+        }
+        swRec = &swFrames[0];
+    }
+
+    struct RasterCtxSW {
+        const FrameSW *frame;
+        ColorSW       *colorEnd;
+        const uint8   *owner;
+        const uint8   *texels;   // tile indices; NULL for RGBA-textured 2D
+        Texture       *tex;
+        const ColorSW *pal;      // scene palette for this batch (dry or underwater)
+        bool           affine, ortho, testZ, writeZ;
+        short4         clip;
+        int            band;     // 0: main core, 1: worker core
+        long long      pixels;
+    };
+
+    static inline bool ownsRowSW(const RasterCtxSW &ctx, int y) {
+        return ctx.owner[y >> SW_BAND_SHIFT] == ctx.band;
+    }
+
+    // 2D spans: texel (or white) times the primitive's vertex colour,
+    // alpha-blended over what is on screen - as the GL UI shader does.
+    void drawSpanOrthoSW(RasterCtxSW &ctx, int y, int x0, int x1, const PlaneSW &pU, const PlaneSW &pV, const PlaneSW &pL,
+                         bool noTex, bool solid, uint32 primColor) {
+        ctx.pixels += x1 - x0;
+        const float xc = float(x0) + 0.5f;
+        const float yc = float(y) + 0.5f;
+        float fu = pU.dx * xc + pU.dy * yc + pU.c;
+        float fv = pV.dx * xc + pV.dy * yc + pV.c;
+        float fl = pL.dx * xc + pL.dy * yc + pL.c;
+
+        ColorSW *color = ctx.colorEnd - y * Core::width;   // mirrored row: pixel x at color[-x]
+        const uint8   *texels   = ctx.texels;
+        const uint8   *lightSel = ctx.frame->lightSel;
+        const ColorSW *palUI    = ctx.frame->palUI;
+        const int cr =  primColor        & 0xFF;
+        const int cg = (primColor >>  8) & 0xFF;
+        const int cb = (primColor >> 16) & 0xFF;
+        const int ca = (primColor >> 24) & 0xFF;
+        const int32 UV_MAX = (256 << 16) - 1;
+
+        for (int x = x0; x < x1; x++, fu += pU.dx, fv += pV.dx, fl += pL.dx) {
+            int r, g, b;
+            int pa = 255;
+            if (solid) {
+                r = g = b = 255;
+            } else if (noTex || !texels) {
+                Texture *tex = ctx.tex;
+                if (tex && tex->memory && tex->width > 0 && tex->height > 0) {
+                    int tx = int(((long long)(int32(fu) >> 16) * tex->width)  >> 15);
+                    int ty = int(((long long)(int32(fv) >> 16) * tex->height) >> 15);
+                    if (tx < 0) tx = 0; else if (tx >= tex->width)  tx = tex->width  - 1;
+                    if (ty < 0) ty = 0; else if (ty >= tex->height) ty = tex->height - 1;
+                    const uint8 *px = tex->memory + (ty * tex->width + tx) * 4;
+                    r = px[0]; g = px[1]; b = px[2]; pa = px[3];
+                } else {
+                    r = g = b = 255;
+                }
+            } else {
+                int32 u = int32(fu), v = int32(fv);
+                if (u < 0) u = 0; else if (u > UV_MAX) u = UV_MAX;
+                if (v < 0) v = 0; else if (v > UV_MAX) v = UV_MAX;
+                uint8 index = texels[((v >> 16) << 8) + (u >> 16)];
+                if (index == 0) continue;
+                int32 li = int32(fl) >> (16 + 3);
+                if ((uint32)li > 31u) li = li < 0 ? 0 : 31;
+                ColorSW t = palUI[lightSel[(li << 8) + index]];
+                r = (t >> 16) & 0xFF;
+                g = (t >>  8) & 0xFF;
+                b =  t        & 0xFF;
+            }
+            // x / 255, exact for 0..65535, without a division
+            #define DIV255_SW(x) (((x) + 1 + ((x) >> 8)) >> 8)
+            r = DIV255_SW(r * cr);
+            g = DIV255_SW(g * cg);
+            b = DIV255_SW(b * cb);
+            const int ea = DIV255_SW(ca * pa);
+            if (ea < 255) {
+                if (ea == 0) continue;
+                ColorSW d = color[-x];
+                r = DIV255_SW(r * ea + ((d >> 16) & 0xFF) * (255 - ea));
+                g = DIV255_SW(g * ea + ((d >>  8) & 0xFF) * (255 - ea));
+                b = DIV255_SW(b * ea + ( d        & 0xFF) * (255 - ea));
+            }
+            color[-x] = ColorSW(0xFF000000u | (r << 16) | (g << 8) | b);
+        }
+    }
+
+    // The innermost loop, generated for each depth test/write combination so
+    // the per-pixel code carries no checks whose answer never changes.
+    template <bool TEST_Z, bool WRITE_Z>
+    static inline void spanPixelsSW(int &x, int len, ColorSW *color, DepthSW *depth,
+                                    const uint8 *texels, const uint8 *lightSel, const ColorSW *palWorld,
+                                    int32 u, int32 du, int32 v, int32 dv, int32 lv, int32 dl, int32 z, int32 dz) {
+        for (int k = 0; k < len; k++, x++) {
+            if (!TEST_Z || (z >> 8) >= depth[x]) {
+                const uint8 index = texels[((v >> 16) << 8) + (u >> 16)];
+                if (index != 0) {
+                    color[-x] = palWorld[lightSel[((lv >> 19) << 8) + index]];
+                    if (WRITE_Z) depth[x] = DepthSW(z >> 8);
+                }
+            }
+            u  += du;
+            v  += dv;
+            z  += dz;
+            lv += dl;
+        }
+    }
+
+    void drawSpanSW(RasterCtxSW &ctx, int y, int x0, int x1, const PlaneSW &pU, const PlaneSW &pV, const PlaneSW &pQ, const PlaneSW &pL) {
+        const uint8 *texels = ctx.texels;
+        if (!texels) return;
+        ctx.pixels += x1 - x0;
+        const float xc = float(x0) + 0.5f;
+        const float yc = float(y) + 0.5f;
+        float pu = pU.dx * xc + pU.dy * yc + pU.c;
+        float pv = pV.dx * xc + pV.dy * yc + pV.c;
+        float pq = pQ.dx * xc + pQ.dy * yc + pQ.c;
+        float l  = pL.dx * xc + pL.dy * yc + pL.c;
+
+        const int32    row      = y * Core::width;
+        ColorSW       *color    = ctx.colorEnd - row;     // mirrored: pixel x at color[-x]
+        DepthSW       *depth    = swDepth ? swDepth + row : NULL;
+        const bool     testZ    = depth && ctx.testZ;
+        const bool     writeZ   = depth && ctx.writeZ;
+        const bool     affine   = ctx.affine;
+        const uint8   *lightSel = ctx.frame->lightSel;
+        const ColorSW *palWorld = ctx.pal;
+        const int32    UV_MAX   = (256 << 16) - 1;
+        const int32    LV_MAX   = (32 << 19) - 1;
+        const int32    Z_MAX    = (65535 << 8);
+
+        float invA = 1.0f / (pq < 1e-6f ? 1e-6f : pq);
+        int x = x0;
+        while (x < x1) {
+            int len = x1 - x;
+            if (len > SW_PERSP_SPAN) len = SW_PERSP_SPAN;
+
+            float pu1 = pu + pU.dx * float(len);
+            float pv1 = pv + pV.dx * float(len);
+            float pq1 = pq + pQ.dx * float(len);
+            float l1  = l  + pL.dx * float(len);
+
+            int32 ua, va, ub, vb;
+            if (affine) {
+                ua = int32(pu);  va = int32(pv);
+                ub = int32(pu1); vb = int32(pv1);
+            } else {
+                float qb   = pq1 < 1e-6f ? 1e-6f : pq1;
+                float invB = 1.0f / qb;
+                ua = int32(pu  * invA); va = int32(pv  * invA);
+                ub = int32(pu1 * invB); vb = int32(pv1 * invB);
+                invA = invB;
+            }
+            if (ua < 0) ua = 0; else if (ua > UV_MAX) ua = UV_MAX;
+            if (ub < 0) ub = 0; else if (ub > UV_MAX) ub = UV_MAX;
+            if (va < 0) va = 0; else if (va > UV_MAX) va = UV_MAX;
+            if (vb < 0) vb = 0; else if (vb > UV_MAX) vb = UV_MAX;
+            int32 lvA = int32(l), lvB = int32(l1);
+            if (lvA < 0) lvA = 0; else if (lvA > LV_MAX) lvA = LV_MAX;
+            if (lvB < 0) lvB = 0; else if (lvB > LV_MAX) lvB = LV_MAX;
+            int32 zA = int32(pq * 536870912.0f), zB = int32(pq1 * 536870912.0f);
+            if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
+            if (zB < 0) zB = 0; else if (zB > Z_MAX) zB = Z_MAX;
+
+            int32 u  = ua, v = va;
+            int32 du = (ub - ua) / len;
+            int32 dv = (vb - va) / len;
+            int32 lv = lvA;
+            int32 dl = (lvB - lvA) / len;
+            int32 z  = zA;
+            int32 dz = (zB - zA) / len;
+
+            if (testZ) {
+                if (writeZ) spanPixelsSW<true,  true >(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
+                else        spanPixelsSW<true,  false>(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
+            } else {
+                if (writeZ) spanPixelsSW<false, true >(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
+                else        spanPixelsSW<false, false>(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
+            }
+            pu = pu1;
+            pv = pv1;
+            pq = pq1;
+            l  = l1;
+        }
+    }
+
+    struct EdgeSW {
+        float x0, y0, slope;
+    };
+
+    static inline void edgeSW(EdgeSW &e, const VertexSW *top, const VertexSW *bottom) {
+        float dy = bottom->fy - top->fy;
+        e.x0 = top->fx;
+        e.y0 = top->fy;
+        e.slope = (dy > 0.0f) ? (bottom->fx - top->fx) / dy : 0.0f;
+    }
+
+    static inline int ceilSW(float x) {
+        int i = int(x);
+        return i + (float(i) < x ? 1 : 0);
+    }
+
+    void rasterTriangleSW(RasterCtxSW &ctx, const VertexSW *a, const VertexSW *b, const VertexSW *c) {
+        float area = (b->fx - a->fx) * (c->fy - a->fy) - (c->fx - a->fx) * (b->fy - a->fy);
+        if (area > -1e-4f && area < 1e-4f) return;
+
+        const VertexSW *t = a, *m = b, *d = c, *s;
+        if (m->fy < t->fy) { s = t; t = m; m = s; }
+        if (d->fy < t->fy) { s = t; t = d; d = s; }
+        if (d->fy < m->fy) { s = m; m = d; d = s; }
+
+        int y0 = ceilSW(t->fy - 0.5f);
+        int y1 = ceilSW(d->fy - 0.5f);
+        if (y0 < ctx.clip.y) y0 = ctx.clip.y;
+        if (y1 > ctx.clip.w) y1 = ctx.clip.w;
+        if (y0 >= y1) return;
+
+        // first row of this triangle that belongs to this core, before any setup
+        int firstOwned = y0;
+        while (firstOwned < y1 && !ownsRowSW(ctx, firstOwned)) {
+            firstOwned = ((firstOwned >> SW_BAND_SHIFT) + 1) << SW_BAND_SHIFT;
+        }
+        if (firstOwned >= y1) return;
+
+        const float invArea = 1.0f / area;
+        const bool  noTex   = (ctx.texels == NULL);
+        const bool  solid   = ctx.ortho && a->u == b->u && b->u == c->u && a->v == b->v && b->v == c->v;
+        uint32 primColor = 0;
+        if (ctx.ortho) {
+            for (int ch = 0; ch < 32; ch += 8) {
+                uint32 sum = ((a->color >> ch) & 0xFF) + ((b->color >> ch) & 0xFF) + ((c->color >> ch) & 0xFF);
+                primColor |= (sum / 3) << ch;
+            }
         }
 
-        if (m->y != t->y) drawPart(*t, *t, *m, *n);
-        if (m->y != b->y) drawPart(*m, *n, *b, *b);
+        PlaneSW pU, pV, pQ, pL;
+        if (ctx.affine) {
+            planeSW(pU, a, b, c, float(a->u), float(b->u), float(c->u), invArea);
+            planeSW(pV, a, b, c, float(a->v), float(b->v), float(c->v), invArea);
+        } else {
+            planeSW(pU, a, b, c, a->pu, b->pu, c->pu, invArea);
+            planeSW(pV, a, b, c, a->pv, b->pv, c->pv, invArea);
+        }
+        planeSW(pQ, a, b, c, a->pq, b->pq, c->pq, invArea);
+        planeSW(pL, a, b, c, float(a->l), float(b->l), float(c->l), invArea);
+
+        EdgeSW eLong, eTop, eBottom;
+        edgeSW(eLong,   t, d);
+        edgeSW(eTop,    t, m);
+        edgeSW(eBottom, m, d);
+
+        for (int y = firstOwned; y < y1; y++) {
+            if (!ownsRowSW(ctx, y)) {
+                y = (((y >> SW_BAND_SHIFT) + 1) << SW_BAND_SHIFT) - 1;   // on to the next group
+                continue;
+            }
+            float yc = float(y) + 0.5f;
+            float xa = eLong.x0 + eLong.slope * (yc - eLong.y0);
+            const EdgeSW &eShort = (yc < m->fy) ? eTop : eBottom;
+            float xb = eShort.x0 + eShort.slope * (yc - eShort.y0);
+            float xl = xa < xb ? xa : xb;
+            float xr = xa < xb ? xb : xa;
+            int x0 = ceilSW(xl - 0.5f);
+            int x1 = ceilSW(xr - 0.5f);
+            if (x0 < ctx.clip.x) x0 = ctx.clip.x;
+            if (x1 > ctx.clip.z) x1 = ctx.clip.z;
+            if (x0 < x1) {
+                if (ctx.ortho) drawSpanOrthoSW(ctx, y, x0, x1, pU, pV, pL, noTex, solid, primColor);
+                else           drawSpanSW(ctx, y, x0, x1, pU, pV, pQ, pL);
+            }
+        }
+    }
+
+    // ---- recording (main core) ----
+    static inline CmdSW* swNewCmd() {
+        swInitFrames();
+        FrameSW &f = *swRec;
+        if (f.cmdCount >= SW_MAX_CMDS) {
+            f.overflow = true;
+            return NULL;
+        }
+        return &f.cmds[f.cmdCount++];
+    }
+
+    void swRecordClear(bool color, bool depth) {
+        CmdSW *cmd = swNewCmd();
+        if (!cmd) return;
+        cmd->type  = SW_CMD_CLEAR;
+        cmd->color = color;
+        cmd->depth = depth;
+    }
+
+    void swRecordBlit(Texture *tex, int sx0, int sy0, int sw, int sh, int ox0, int oy0, int ow, int oh) {
+        CmdSW *cmd = swNewCmd();
+        if (!cmd) return;
+        cmd->type = SW_CMD_BLIT;
+        cmd->tex  = tex;
+        cmd->sx0 = sx0; cmd->sy0 = sy0; cmd->sw = sw; cmd->sh = sh;
+        cmd->ox0 = ox0; cmd->oy0 = oy0; cmd->ow = ow; cmd->oh = oh;
+    }
+
+    void swBeginBatch(bool ortho, int maxTris) {
+        swInitFrames();
+        FrameSW &f = *swRec;
+        const int n = swVertices.length;
+        swBatch = NULL;
+        if (f.vertCount + n > SW_MAX_VERTS || f.triCount + maxTris > SW_MAX_TRIS || f.cmdCount >= SW_MAX_CMDS) {
+            f.overflow = true;   // extremely rare: drop the rest of this frame's geometry
+            return;
+        }
+        memcpy(f.verts + f.vertCount, swVertices.items, n * sizeof(VertexSW));
+        swBatchBase  = f.verts + f.vertCount;
+        f.vertCount += n;
+
+        swBatch = &f.cmds[f.cmdCount++];
+        swBatch->type     = SW_CMD_TRIS;
+        swBatch->texels   = curTile ? curTile->index : NULL;
+        swBatch->tex      = Core::active.textures[0];
+        swBatch->affine   = (curTile == (Tile8*)swGradient);
+        swBatch->ortho    = ortho;
+        swBatch->testZ    = swDepthTest;
+        swBatch->writeZ   = swDepthWrite;
+        swBatch->water    = swBatchWater;
+        swBatch->clip     = swClipRect;
+        swBatch->triStart = f.triCount;
+        swBatch->triCount = 0;
+    }
+
+    void swEndBatch() {
+        if (swBatch) swBatch->triCount = swRec->triCount - swBatch->triStart;
+    }
+
+    static inline void swAddTri(Index ia, Index ib, Index ic) {
+        TriSW &t = swRec->tris[swRec->triCount++];
+        t.a = swBatchBase + ia;
+        t.b = swBatchBase + ib;
+        t.c = swBatchBase + ic;
+    }
+
+    void drawTriangle(Index *indices) {
+        if (!swBatch) return;
+        const VertexSW *t = swVertices.items + indices[0];
+        const VertexSW *m = swVertices.items + indices[1];
+        const VertexSW *b = swVertices.items + indices[2];
+        if (checkBackface(t, m, b)) return;
+        swAddTri(indices[0], indices[1], indices[2]);
     }
 
     void drawQuad(Index *indices) {
-    /*
-             t
-            /\ <----- top triangle
-         m /__\/ n
-           \  /\
-            \   \ <-- quad
-           p \/__\ o
-             /\  / 
-               \/ <-- bottom triangle
-               b
-    */
-        VertexSW _n;
-        VertexSW _p;
-        VertexSW *t = swVertices.items + indices[0];
-        VertexSW *m = swVertices.items + indices[1];
-        VertexSW *b = swVertices.items + indices[2];
-        VertexSW *o = swVertices.items + indices[3];
-        VertexSW *n = &_n;
-        VertexSW *p = &_p;
+        if (!swBatch) return;
+        const VertexSW *t = swVertices.items + indices[0];
+        const VertexSW *m = swVertices.items + indices[1];
+        const VertexSW *b = swVertices.items + indices[2];
+        if (checkBackface(t, m, b)) return;
+        swAddTri(indices[0], indices[1], indices[2]);
+        swAddTri(indices[0], indices[2], indices[3]);
+    }
 
-        if (checkBackface(t, m, b))
-            return;
-
-        int32 cx1 = swClipRect.x << 16;
-        int32 cx2 = swClipRect.z << 16;
-
-        if (t->x < cx1 && m->x < cx1 && o->x < cx1 && b->x < cx1)
-            return;
-
-        if (t->x > cx2 && m->x > cx2 && o->x > cx2 && b->x > cx2)
-            return;
-
-        sortVertices(t, m, b, o);
-
-        if (b->y < swClipRect.y || t->y > swClipRect.w)
-            return;
-
-        if (checkBackface(t, b, m) == checkBackface(t, b, o)) {
-
-            VertexSW d = (*b - *t) / (b->y - t->y);
-
-            *n = *t + d * (m->y - t->y);
-            *p = *t + d * (o->y - t->y);
-
-            n->y = m->y;
-            p->y = o->y;
-
-        } else {
-
-            if (o->y != t->y) {
-                *n = *t + ((*o - *t) / (o->y - t->y) * (m->y - t->y));
-                n->y = m->y;
+    // ---- replay (both cores) ----
+    static void swExecBlit(const RasterCtxSW &ctx, const CmdSW &cmd) {
+        Texture *tex = cmd.tex;
+        const int W = Core::width, H = Core::height;
+        for (int y = 0; y < H; y++) {
+            if (!ownsRowSW(ctx, y)) continue;
+            ColorSW *row = ctx.colorEnd - y * W;
+            const int iy = y - cmd.oy0;
+            if (!tex || !tex->memory || iy < 0 || iy >= cmd.oh) {
+                memset(row - (W - 1), 0, W * sizeof(ColorSW));
+                continue;
             }
-
-            if (m->y != b->y) {
-                *p = *b + ((*m - *b) / (m->y - b->y) * (o->y - b->y));
-                p->y = o->y;
+            const uint8 *src = tex->memory + (size_t)(cmd.sy0 + iy * cmd.sh / cmd.oh) * tex->width * 4;
+            if (cmd.ox0 > 0) memset(row - (cmd.ox0 - 1), 0, cmd.ox0 * sizeof(ColorSW));
+            const uint32 step = (uint32(cmd.sw) << 16) / uint32(cmd.ow);
+            uint32 acc = 0;
+            for (int x = 0; x < cmd.ow; x++, acc += step) {
+                const uint8 *px = src + (cmd.sx0 + int(acc >> 16)) * 4;
+                row[-(cmd.ox0 + x)] = ColorSW(0xFF000000u | (px[0] << 16) | (px[1] << 8) | px[2]);
             }
+            const int right = W - cmd.ox0 - cmd.ow;
+            if (right > 0) memset(row - (W - 1), 0, right * sizeof(ColorSW));
+        }
+    }
 
+    static void swExecute(FrameSW &f, int band, long long &pixels) {
+        RasterCtxSW ctx;
+        ctx.frame    = &f;
+        ctx.colorEnd = f.colorEnd;
+        ctx.owner    = f.owner;
+        ctx.band     = band;
+        ctx.pixels   = 0;
+        const int W = Core::width, H = Core::height;
+        for (int i = 0; i < f.cmdCount; i++) {
+            const CmdSW &cmd = f.cmds[i];
+            if (cmd.type == SW_CMD_CLEAR) {
+                for (int y = 0; y < H; y++) {
+                    if (!ownsRowSW(ctx, y)) continue;
+                    if (cmd.color) memset(ctx.colorEnd - y * W - (W - 1), 0, W * sizeof(ColorSW));
+                    if (cmd.depth && swDepth) memset(swDepth + y * W, 0, W * sizeof(DepthSW));
+                }
+            } else if (cmd.type == SW_CMD_BLIT) {
+                swExecBlit(ctx, cmd);
+            } else {
+                ctx.texels = cmd.texels;
+                ctx.tex    = cmd.tex;
+                ctx.affine = cmd.affine;
+                ctx.ortho  = cmd.ortho;
+                ctx.testZ  = cmd.testZ;
+                ctx.writeZ = cmd.writeZ;
+                ctx.clip   = cmd.clip;
+                ctx.pal    = cmd.water ? f.palWater : f.palWorld;
+                const TriSW *tri = f.tris + cmd.triStart;
+                for (int k = 0; k < cmd.triCount; k++, tri++) {
+                    rasterTriangleSW(ctx, tri->a, tri->b, tri->c);
+                }
+            }
+        }
+        pixels += ctx.pixels;
+    }
+
+    static void swBuildShadeFrame(FrameSW &f) {
+        // Always from the real light map and the normal palette (the core may
+        // have switched to the unshaded ones for the UI by now). Shade 0 is
+        // taken as the brightest; if the map says otherwise, read it reversed.
+        int lum0 = 0, lum31 = 0;
+        for (int i = 1; i < 256; i++) {
+            ColorSW a = swPaletteColor[swLightmapShade[i]];
+            ColorSW b = swPaletteColor[swLightmapShade[(31 << 8) + i]];
+            lum0  += ((a >> 16) & 0xFF) + ((a >> 7) & 0x1FE) + (a & 0xFF);
+            lum31 += ((b >> 16) & 0xFF) + ((b >> 7) & 0x1FE) + (b & 0xFF);
+        }
+        const bool flip = lum0 < lum31;
+        for (int li = 0; li < 32; li++) {
+            const int src = flip ? 31 - li : li;
+            memcpy(f.lightSel + (li << 8), swLightmapShade + (src << 8), 256);
+        }
+        for (int i = 0; i < 256; i++) {
+            ColorSW col = swPaletteColor[i] | 0xFF000000u;
+            f.palUI[i]    = col;
+            f.palWorld[i] = col;
+            f.palWater[i] = tintSW(col, 154, 230, 230);   // the level's underwater colour: 0.6, 0.9, 0.9
+        }
+    }
+
+    static void swBuildOwner(FrameSW &f, int k) {
+        const int groups = (Core::height + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
+        for (int g = 0; g < SW_GROUPS; g++) f.owner[g] = 0;
+        for (int g = 0; g < groups && g < SW_GROUPS; g++) {   // spread the worker's groups evenly
+            f.owner[g] = uint8(((g + 1) * k) / groups - (g * k) / groups);
+        }
+    }
+
+    struct WorkerSW {
+        pthread_t       thread;
+        pthread_mutex_t mutex;
+        pthread_cond_t  cond;
+        FrameSW        *job;
+        int             seq, done;
+        bool            started;
+        long long       pixels, busy, endTime;
+    };
+    WorkerSW swWorker;
+
+    static void* swWorkerProc(void *arg) {
+        int seen = 0;
+        for (;;) {
+            pthread_mutex_lock(&swWorker.mutex);
+            while (swWorker.seq == seen) {
+                pthread_cond_wait(&swWorker.cond, &swWorker.mutex);
+            }
+            seen = swWorker.seq;
+            FrameSW *job = swWorker.job;
+            pthread_mutex_unlock(&swWorker.mutex);
+
+            const long long tStart = swPerfNow();
+            long long px = 0;
+            swExecute(*job, 1, px);
+            const long long tEnd = swPerfNow();
+
+            pthread_mutex_lock(&swWorker.mutex);
+            swWorker.busy    = tEnd - tStart;
+            swWorker.endTime = tEnd;
+            swWorker.pixels  = px;
+            swWorker.done    = seen;
+            pthread_cond_broadcast(&swWorker.cond);
+            pthread_mutex_unlock(&swWorker.mutex);
+        }
+        return NULL;
+    }
+
+    static void swStartWorker(FrameSW *f) {
+        if (!swWorker.started) {
+            pthread_mutex_init(&swWorker.mutex, NULL);
+            pthread_cond_init(&swWorker.cond, NULL);
+            swWorker.seq = swWorker.done = 0;
+            swWorker.started = true;
+            pthread_create(&swWorker.thread, NULL, swWorkerProc, NULL);
+
+            // pin the two threads to different cores (the scheduler kept both on core 0)
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(1, &set);
+            int rw = pthread_setaffinity_np(swWorker.thread, sizeof(set), &set);
+            CPU_ZERO(&set);
+            CPU_SET(0, &set);
+            int rm = pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+            fprintf(stderr, "mt: pin worker->core1 %s, main->core0 %s\n",
+                rw == 0 ? "ok" : "FAILED", rm == 0 ? "ok" : "FAILED");
+        }
+        pthread_mutex_lock(&swWorker.mutex);
+        swWorker.job = f;
+        swWorker.seq++;
+        pthread_cond_broadcast(&swWorker.cond);
+        pthread_mutex_unlock(&swWorker.mutex);
+    }
+
+    // Finish the pending frame: the main core draws its share, waits for the
+    // worker, rebalances the split, and the frame goes to the screen.
+    static void swFinishPending() {
+        if (!swPend) return;
+        FrameSW &f = *swPend;
+
+        const long long t0 = swPerfNow();
+        long long px = 0;
+        swExecute(f, 0, px);
+        const long long t1 = swPerfNow();
+
+        pthread_mutex_lock(&swWorker.mutex);
+        while (swWorker.done != swWorker.seq) {
+            pthread_cond_wait(&swWorker.cond, &swWorker.mutex);
+        }
+        px += swWorker.pixels;
+        const long long workerEnd  = swWorker.endTime;
+        const long long workerBusy = swWorker.busy;
+        pthread_mutex_unlock(&swWorker.mutex);
+        const long long t2 = swPerfNow();
+
+        // Balance: whoever finished first gets more of the next frame.
+        const int groups = (Core::height + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
+        const long long mainWait   = t2 - t1;          // main idle, waiting for the worker
+        const long long workerIdle = t1 - workerEnd;   // worker done before the main core
+        {
+            // While the main core recorded the next frame, the worker had the
+            // pending one to itself; split the rest so both finish together,
+            // using this frame's cost per 8-line group.
+            const double rec  = double(t0 - swLaunchTime);
+            const double cost = double(workerBusy + (t1 - t0)) / groups;
+            if (cost > 1.0) {
+                double target = (rec / cost + groups) * 0.5;
+                if (target < 2) target = 2;
+                if (target > groups) target = groups;
+                swWorkerGroups = int((swWorkerGroups * 3 + target) / 4.0 + 0.5);
+            }
         }
 
-        if (o->y != t->y && m->x > n->x) swap(m, n);
-        if (m->y != b->y && p->x > o->x) swap(p, o);
 
-        if (t->y != m->y) drawPart(*t, *t, *m, *n);
-        if (m->y != o->y) drawPart(*m, *n, *p, *o);
-        if (o->y != b->y) drawPart(*p, *o, *b, *b);
+        swPerfPixels += px;
+        swPerfRaster += t2 - t0;
+
+        if (swPresent) swPresent(f.buffer);   // waits for the other buffer's copy, then starts this one
+
+        f.cmdCount = f.triCount = f.vertCount = 0;
+        f.overflow = false;
+        swPend = NULL;
+    }
+
+    // End of the main loop's frame: finish the previous frame and hand this
+    // one to the worker core, which starts on it right away.
+    void swFrameEnd() {
+        swInitFrames();
+        swFinishPending();
+
+        FrameSW &f = *swRec;
+        if (f.overflow) {
+            static int warned = 0;
+            if (warned++ < 5) fprintf(stderr, "sw: frame lists full, some geometry dropped\n");
+        }
+        if (f.cmdCount == 0) return;
+
+        const int W = Core::width, H = Core::height;
+        if (!swBuffers[0]) {
+            for (int i = 0; i < 2; i++) {
+                swBuffers[i] = new ColorSW[W * H];
+                memset(swBuffers[i], 0, W * H * sizeof(ColorSW));
+            }
+        }
+        f.buffer   = swBuffers[swNextBuffer];
+        f.colorEnd = f.buffer + W * H - 1;
+        swNextBuffer ^= 1;
+
+        swBuildShadeFrame(f);
+        swBuildOwner(f, swWorkerGroups);
+
+        swPend = &f;
+        swLaunchTime = swPerfNow();
+        swStartWorker(&f);
+        swRec = (swRec == &swFrames[0]) ? &swFrames[1] : &swFrames[0];
+    }
+
+    // Finish any frame in flight. Called before textures or palettes change,
+    // so the rasterizer never reads anything that is being freed.
+    void swDrain() {
+        swFinishPending();
     }
 
     void applyLighting(VertexSW &result, const Vertex &vertex, float depth) {
+        float lighting = 0.0f;
+        if (lightsCount > 0) {   // most vertices have no dynamic light: skip the normalize
         vec3 coord  = vec3(float(vertex.coord.x), float(vertex.coord.y), float(vertex.coord.z));
         vec3 normal = vec3(float(vertex.normal.x), float(vertex.normal.y), float(vertex.normal.z)).normal();
-        float lighting = 0.0f;
         for (int i = 0; i < lightsCount; i++) {
             LightSW &light = lightsRel[i];
             vec3 dir = (light.pos - coord) * light.radius;
@@ -599,18 +1333,156 @@ namespace GAPI {
             float lum = normal.dot(dir / sqrtf(att));
             lighting += (max(0.0f, lum) * max(0.0f, 1.0f - att)) * light.intensity;
         }
+        }
 
         lighting += result.l;
 
         depth -= SW_FOG_START;
-        if (depth > 0.0f) {
+        if (depth > 0.0f && !swSkyBatch) {
             lighting *= clamp(1.0f - depth / (SW_MAX_DIST - SW_FOG_START), 0.0f, 1.0f);
         }
 
+        if (swSkyBatch) lighting = 255.0f;   // the sky is unlit: full brightness
         result.l = (255 - min(255, int32(lighting))) << 16;
     }
 
+    // Near-plane clipping. Upstream dropped any primitive with a vertex
+    // behind the camera, so large floor/wall polygons close to the camera
+    // vanished whole (the floor behind Lara turned black as she walked).
+    // Primitives crossing the near plane are now cut at it and drawn as a
+    // triangle fan, the way a hardware rasterizer would.
+    #define SW_NEAR_W 32.0f
+
+    struct ClipVertexSW {
+        vec4  c;
+        int32 u, v, l;
+        uint32 color;
+    };
+
+    int32 projectVertexSW(const ClipVertexSW &cv) {
+        vec4 c = cv.c;
+        const float invW = 1.0f / c.w;
+        c.x *= invW;
+        c.y *= invW;
+        c.z *= invW;
+        c.x = clamp(c.x, -16384.0f, 16384.0f);
+        c.y = clamp(c.y, -16384.0f, 16384.0f);
+
+        VertexSW result;
+        // Keep x with sub-pixel precision: rounding it to whole pixels before
+        // rasterizing made vertices snap and edges wobble as the camera moved.
+        result.x = int32(c.x * 65536.0f);
+        result.y = int32(floorf(c.y + 0.5f));
+        result.z = uint32(clamp(c.z, 0.0f, 1.0f) * 65535.0f) << 16;
+        result.w = int32(cv.c.w) << 16;
+        result.u = cv.u;
+        result.v = cv.v;
+        result.l = cv.l;
+        result.pq = invW;
+        result.pu = float(cv.u) * result.pq;
+        result.pv = float(cv.v) * result.pq;
+        result.fx = c.x;
+        result.fy = c.y;
+        result.color = cv.color;
+        return swVertices.push(result);
+    }
+
+    static inline int32 lerpFixedSW(int32 a, int32 b, double t) {
+        return int32(double(a) + (double(b) - double(a)) * t);
+    }
+
+    ClipVertexSW clipEdgeSW(const ClipVertexSW &a, const ClipVertexSW &b) {
+        double t = (double(SW_NEAR_W) - double(a.c.w)) / (double(b.c.w) - double(a.c.w));
+        ClipVertexSW r;
+        r.c.x = float(a.c.x + (b.c.x - a.c.x) * t);
+        r.c.y = float(a.c.y + (b.c.y - a.c.y) * t);
+        r.c.z = float(a.c.z + (b.c.z - a.c.z) * t);
+        r.c.w = SW_NEAR_W;
+        r.u = lerpFixedSW(a.u, b.u, t);
+        r.v = lerpFixedSW(a.v, b.v, t);
+        r.l = lerpFixedSW(a.l, b.l, t);
+        r.color = a.color;
+        return r;
+    }
+
+    // This rasterizer maps textures affinely (u/v interpolated linearly in
+    // screen space, like the PS1), which warps them badly on polygons whose
+    // depth varies a lot across them: walls right next to the camera, or the
+    // pieces left by near-plane clipping. Split such polygons into smaller
+    // ones - the classic fix on hardware without perspective-correct
+    // texturing. Far polygons have nearly uniform depth and are left alone.
+    #define SW_SUBDIV_RATIO 1.25f
+    #define SW_SUBDIV_DEPTH 0  // disabled: perspective-correct texturing replaced it
+
+    static inline ClipVertexSW midVertexSW(const ClipVertexSW &a, const ClipVertexSW &b) {
+        ClipVertexSW r;
+        r.c.x = (a.c.x + b.c.x) * 0.5f;
+        r.c.y = (a.c.y + b.c.y) * 0.5f;
+        r.c.z = (a.c.z + b.c.z) * 0.5f;
+        r.c.w = (a.c.w + b.c.w) * 0.5f;
+        r.u = (a.u >> 1) + (b.u >> 1);
+        r.v = (a.v >> 1) + (b.v >> 1);
+        r.l = (a.l >> 1) + (b.l >> 1);
+        r.color = a.color;
+        return r;
+    }
+
+    void emitPolygonSW(const ClipVertexSW *v, int n, int depth) {
+        float minW = v[0].c.w;
+        float maxW = v[0].c.w;
+        for (int k = 1; k < n; k++) {
+            if (v[k].c.w < minW) minW = v[k].c.w;
+            if (v[k].c.w > maxW) maxW = v[k].c.w;
+        }
+
+        if (depth < SW_SUBDIV_DEPTH && maxW > minW * SW_SUBDIV_RATIO) {
+            if (n == 3) {
+                ClipVertexSW m01 = midVertexSW(v[0], v[1]);
+                ClipVertexSW m12 = midVertexSW(v[1], v[2]);
+                ClipVertexSW m20 = midVertexSW(v[2], v[0]);
+                ClipVertexSW t0[3] = { v[0], m01,  m20  };
+                ClipVertexSW t1[3] = { m01,  v[1], m12  };
+                ClipVertexSW t2[3] = { m20,  m12,  v[2] };
+                ClipVertexSW t3[3] = { m01,  m12,  m20  };
+                emitPolygonSW(t0, 3, depth + 1);
+                emitPolygonSW(t1, 3, depth + 1);
+                emitPolygonSW(t2, 3, depth + 1);
+                emitPolygonSW(t3, 3, depth + 1);
+            } else {
+                ClipVertexSW m01 = midVertexSW(v[0], v[1]);
+                ClipVertexSW m12 = midVertexSW(v[1], v[2]);
+                ClipVertexSW m23 = midVertexSW(v[2], v[3]);
+                ClipVertexSW m30 = midVertexSW(v[3], v[0]);
+                ClipVertexSW mc  = midVertexSW(m01, m23);
+                ClipVertexSW q0[4] = { v[0], m01,  mc,   m30  };
+                ClipVertexSW q1[4] = { m01,  v[1], m12,  mc   };
+                ClipVertexSW q2[4] = { mc,   m12,  v[2], m23  };
+                ClipVertexSW q3[4] = { m30,  mc,   m23,  v[3] };
+                emitPolygonSW(q0, 4, depth + 1);
+                emitPolygonSW(q1, 4, depth + 1);
+                emitPolygonSW(q2, 4, depth + 1);
+                emitPolygonSW(q3, 4, depth + 1);
+            }
+            return;
+        }
+
+        int32 first = swIndices.length;
+        for (int k = 0; k < n; k++) {
+            swIndices.push(projectVertexSW(v[k]));
+        }
+        if (n == 3) {
+            swTriangles.push(first);
+        } else {
+            swQuads.push(first);
+        }
+    }
+
     bool transform(const Index *indices, const Vertex *vertices, int iStart, int iCount, int vStart) {
+        // What is in the water is tinted and shimmers even seen from dry
+        // land, as in the DOS game; with the camera underwater, everything.
+        // The level switches to the water palette for water rooms (and for
+        // objects in them) in setRoomParams.
+        swBatchWater = swUnderwater || swPalette == swPaletteWater;
         swVertices.reset();
         swIndices.reset();
         swTriangles.reset();
@@ -621,70 +1493,120 @@ namespace GAPI {
         swMatrix = swMatrix * mViewProj * mModel;
 
         const bool colored = vertices[vStart + indices[iStart]].color.w == 142;
-        int vIndex = 0;
-        bool isTriangle = false;
 
-        for (int i = 0; i < iCount; i++) {
-            const Index  index   = indices[iStart + i];
-            const Vertex &vertex = vertices[vStart + index];
+        swOrthoBatch = true;
 
-            vIndex++;
+        int i = 0;
+        while (i < iCount) {
+            const bool isTriangle = vertices[vStart + indices[iStart + i]].normal.w == 1;
 
-            if (vIndex == 1) {
-                isTriangle = vertex.normal.w == 1;
+            // the loader splits quads into two triangles with indices 012[02]3;
+            // take positions 0, 1, 2 and 5 to rebuild the quad
+            int pos[4];
+            int n;
+            if (isTriangle) {
+                n = 3;
+                pos[0] = i; pos[1] = i + 1; pos[2] = i + 2;
+                i += 3;
             } else {
-                if (vIndex == 4) { // loader splits quads to two triangles with indices 012[02]3, we ignore [02] to make it quad again!
-                    vIndex++;
-                    i++;
-                    continue;
+                n = 4;
+                pos[0] = i; pos[1] = i + 1; pos[2] = i + 2; pos[3] = i + 5;
+                i += 6;
+            }
+            if (pos[n - 1] >= iCount) break;
+
+            ClipVertexSW poly[4];
+            bool tooFar    = false;
+            bool allFront  = true;
+            bool allBehind = true;
+
+            for (int k = 0; k < n; k++) {
+                const Vertex &vertex = vertices[vStart + indices[iStart + pos[k]]];
+                ClipVertexSW &cv = poly[k];
+                {
+                cv.c = swMatrix * vec4(vertex.coord.x, vertex.coord.y, vertex.coord.z, 1.0f);
+
+                // Underwater, as the DOS game did it: vertices sway a little and
+                // the light shimmers in slow waves. 2D batches (w == 1) are
+                // left alone. Shared vertices move identically, so no seams.
+                float waterPhase = 0.0f;
+                const bool waterFx = swBatchWater && cv.c.w != 1.0f;
+                if (waterFx) {
+                    waterPhase = swWaterTime * 2.0f + (float(vertex.coord.x) + float(vertex.coord.z)) * (1.0f / 256.0f);
                 }
+                if (waterFx && swUnderwater) {   // the sway: only when looking through the water
+                    vec4 pos = vec4(float(vertex.coord.x) + sinf(waterPhase * 1.3f) * 6.0f,
+                                    float(vertex.coord.y) + cosf(waterPhase) * 6.0f,
+                                    float(vertex.coord.z), 1.0f);
+                    cv.c = swMatrix * pos;
+                }
+
+                if (colored) {
+                    cv.u = vertex.color.x << 16;
+                    cv.v = 0;
+                } else {
+                    cv.u = (vertex.texCoord.x << 16);
+                    cv.v = (vertex.texCoord.y << 16);
+                }
+
+                VertexSW lit;
+                lit.x = lit.y = lit.z = lit.w = 0;
+                lit.u = cv.u;
+                lit.v = cv.v;
+                // TR3 lights vertices in colour; use the luminance (identical
+                // to the old red-channel read for TR1/TR2's grey light)
+                lit.l = (((vertex.light.x * 77 + vertex.light.y * 150 + vertex.light.z * 29) >> 8) * ambient) >> 8;
+                applyLighting(lit, vertex, cv.c.w);
+                cv.l = lit.l;
+                if (waterFx) {
+                    cv.l += int32(sinf(waterPhase * 2.1f + swWaterTime) * 22.0f * 65536.0f);
+                }
+                // UI geometry (MeshBuilder::addDynBar / addDynFrame) stores its
+                // colour in the vertex light field only; the colour field is
+                // left unset. Byte order is R, G, B, A.
+                cv.color = uint32(vertex.light.x) | (uint32(vertex.light.y) << 8) |
+                           (uint32(vertex.light.z) << 16) | (uint32(vertex.light.w) << 24);
+
+                }
+                if (cv.c.w > SW_MAX_DIST && !swSkyBatch) tooFar = true;
+                // Orthographic (2D) geometry has w == 1 exactly: it is never
+                // behind the camera and must not be near-clipped.
+                const bool isOrtho = (cv.c.w == 1.0f);
+                if (!isOrtho) swOrthoBatch = false;
+                if (cv.c.w < SW_NEAR_W && !isOrtho) allFront = false; else allBehind = false;
             }
 
-            vec4 c;
-            c = swMatrix * vec4(vertex.coord.x, vertex.coord.y, vertex.coord.z, 1.0f);
+            if (tooFar || allBehind) continue;
 
-            if (c.w < 0.0f || c.w > SW_MAX_DIST) { // skip primitive
-                if (isTriangle) {
-                    i += 3 - vIndex;
-                } else {
-                    i += 6 - vIndex;
+            if (allFront) {
+                int32 first = swIndices.length;
+                for (int k = 0; k < n; k++) {
+                    swIndices.push(projectVertexSW(poly[k]));
                 }
-                vIndex = 0;
+                if (n == 3) {
+                    swTriangles.push(first);
+                } else {
+                    swQuads.push(first);
+                }
                 continue;
             }
 
-            c.x /= c.w;
-            c.y /= c.w;
-            c.z /= c.w;
-            c.x = clamp(c.x, -16384.0f, 16384.0f);
-            c.y = clamp(c.y, -16384.0f, 16384.0f);
-
-            VertexSW result;
-            result.x = int32(c.x) << 16;
-            result.y = int32(c.y);
-            result.z = uint32(clamp(c.z, 0.0f, 1.0f) * 65535.0f) << 16;
-            result.w = int32(c.w);
-
-            if (colored) {
-                result.u = vertex.color.x << 16;
-                result.v = 0;
-            } else {
-                result.u = (vertex.texCoord.x << 16);// / result.w;
-                result.v = (vertex.texCoord.y << 16);// / result.w;
+            // crosses the near plane: Sutherland-Hodgman against w = SW_NEAR_W
+            ClipVertexSW clipped[5];
+            int count = 0;
+            for (int k = 0; k < n; k++) {
+                const ClipVertexSW &a = poly[k];
+                const ClipVertexSW &b = poly[(k + 1) % n];
+                bool aIn = a.c.w >= SW_NEAR_W;
+                bool bIn = b.c.w >= SW_NEAR_W;
+                if (aIn) clipped[count++] = a;
+                if (aIn != bIn) clipped[count++] = clipEdgeSW(a, b);
             }
-            result.w = result.w << 16;
-            result.l = ((vertex.light.x * ambient) >> 8);
+            if (count < 3) continue;
 
-            applyLighting(result, vertex, c.w);
-
-            swIndices.push(swVertices.push(result));
-
-            if (isTriangle && vIndex == 3) {
-                swTriangles.push(swIndices.length - 3);
-                vIndex = 0;
-            } else if (vIndex == 6) {
-                swQuads.push(swIndices.length - 4);
-                vIndex = 0;
+            for (int k = 1; k + 1 < count; k++) {
+                ClipVertexSW tri[3] = { clipped[0], clipped[k], clipped[k + 1] };
+                emitPolygonSW(tri, 3, 0);
             }
         }
 
@@ -701,20 +1623,31 @@ namespace GAPI {
     }
 
     void DIP(Mesh *mesh, const MeshRange &range) {
-        if (curTile == NULL) {
-            //uint32 *tex = (uint32*)Core::active.textures[0]->memory; // TODO
-            return;
-        }
 
         transformLights();
 
         bool colored = transform(mesh->iBuffer, mesh->vBuffer, range.iStart, range.iCount, range.vStart);
+
+        const bool oldDepthTest  = swDepthTest;
+        const bool oldDepthWrite = swDepthWrite;
+        if (swOrthoBatch) {
+            swDepthTest  = false;
+            swDepthWrite = false;
+        }
+        if (curTile == NULL && !swOrthoBatch) {
+            // untextured 3D batches stay unsupported, as upstream
+            swDepthTest  = oldDepthTest;
+            swDepthWrite = oldDepthWrite;
+            return;
+        }
 
         Tile8 *oldTile = curTile;
 
         if (colored) {
             curTile = (Tile8*)swGradient;
         }
+
+        swBeginBatch(swOrthoBatch, swQuads.length * 2 + swTriangles.length);
 
         for (int i = 0; i < swQuads.length; i++) {
             drawQuad(&swIndices[swQuads[i]]);
@@ -724,10 +1657,16 @@ namespace GAPI {
             drawTriangle(&swIndices[swTriangles[i]]);
         }
 
+        swEndBatch();
+
         curTile = oldTile;
+
+        swDepthTest  = oldDepthTest;
+        swDepthWrite = oldDepthWrite;
     }
 
     void initPalette(Color24 *palette, uint8 *lightmap) {
+        swDrain();   // the pending frame still uses the current palette
         for (uint32 i = 0; i < 256; i++) {
             const Color24 &p = palette[i];
             swPaletteColor[i] = CONV_COLOR(p.r, p.g, p.b);

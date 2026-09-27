@@ -94,8 +94,13 @@ struct Collision {
         inf.ceiling   = info.ceiling;
         inf.climb     = info.climb;
 
-        if ((info.ceiling == info.floor) ||  (info.floor - info.ceiling < height) || (pos.y - info.floor > maxAscent) || (info.floor - pos.y > maxDescent) || (info.ceiling > pos.y) ||
-            (maxAscent == maxDescent && (maxAscent <= 256 + 128) && (abs(info.slantX) > 2 || abs(info.slantZ) > 2))) {
+        const bool whyA = (info.ceiling == info.floor);
+        const bool whyB = (info.floor - info.ceiling < height);
+        const bool whyC = (pos.y - info.floor > maxAscent);
+        const bool whyD = (info.floor - pos.y > maxDescent);
+        const bool whyE = (info.ceiling > pos.y);
+        const bool whyF = (maxAscent == maxDescent && (maxAscent <= 256 + 128) && (abs(info.slantX) > 2 || abs(info.slantZ) > 2));
+        if (whyA || whyB || whyC || whyD || whyE || whyF) {
             this->side = side;
             return true;
         }
@@ -119,7 +124,7 @@ struct Collision {
         int dx, dz, x = int(pos.x), z = int(pos.z);
 
         TR::Room::Sector *s = &level->getSector(roomIndex, x, z, dx, dz);
-        while (s->ceiling * 256 > pos.y && s->roomAbove != TR::NO_ROOM) {
+        while (s->ceiling * 256 > pos.y && s->roomAbove != TR::NO_ROOM && !level->isSolidCeilingTriangle(s, x, z)) {
             roomIndex = s->roomAbove;
             s = &level->getSector(roomIndex, x, z, dx, dz);
         }

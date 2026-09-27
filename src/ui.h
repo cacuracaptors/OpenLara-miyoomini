@@ -724,8 +724,55 @@ namespace UI {
             mesh->addDynFrame(pos - 2.0f, size + 4.0f, brColor1, brColor2);
         if (bgColor != 0)
             mesh->addDynBar(whiteSprite, pos - 1.0f, size + 2.0f, bgColor);
-        if ((fgColor != 0 || fgColor2 != 0) && value > 0.0f)
+        if ((fgColor != 0 || fgColor2 != 0) && value > 0.0f) {
+        #ifdef _GAPI_SW
+            // The software renderer has no texture atlas, so the bars' 5-pixel
+            // gradient textures (CommonTexData in level.h) never reach it and
+            // the progress came out plain white. Draw the same five tones as
+            // five horizontal strips instead.
+            if (type == CTEX_OPTION) {
+                // The option bar (menu highlights) is a soft translucent band:
+                // CommonTexData gives five rows of alpha 0x20/0x60/0x80/0x60/0x20,
+                // and its first and last columns are fully transparent, so GL's
+                // filtering fades both ends. Rebuild it from strips: 5 rows x
+                // 3 segments (fading ends, solid middle).
+                static const int   rowA[5]  = { 0x20, 0x60, 0x80, 0x60, 0x20 };
+                static const float segX0[3] = { 0.1f, 0.3f, 0.7f };
+                static const float segX1[3] = { 0.3f, 0.7f, 0.9f };
+                static const int   segA[3]  = { 128, 255, 128 };
+                const float  w  = size.x * value;
+                const uint32 va = fgColor >> 24;
+                for (int i = 0; i < 5; i++) {
+                    float y0 = floorf(pos.y + size.y * i / 5.0f);
+                    float y1 = floorf(pos.y + size.y * (i + 1) / 5.0f);
+                    if (y1 <= y0) continue;
+                    for (int s = 0; s < 3; s++) {
+                        float x0 = floorf(pos.x + w * segX0[s]);
+                        float x1 = floorf(pos.x + w * segX1[s]);
+                        if (x1 <= x0) continue;
+                        uint32 a = uint32(rowA[i]) * va / 255 * uint32(segA[s]) / 255;
+                        if (a == 0) continue;
+                        mesh->addDynBar(whiteSprite, vec2(x0, y0), vec2(x1 - x0, y1 - y0), (fgColor & 0x00FFFFFF) | (a << 24));
+                    }
+                }
+                return;
+            }
+            static const uint32 gradHealth[5] = { 0xFF2C5D71, 0xFF5E81AE, 0xFF2C5D71, 0xFF1B4557, 0xFF16304F };
+            static const uint32 gradOxygen[5] = { 0xFF647464, 0xFFA47848, 0xFF647464, 0xFF4C504C, 0xFF303030 };
+            const uint32 *grad = (type == CTEX_HEALTH) ? gradHealth : ((type == CTEX_OXYGEN) ? gradOxygen : NULL);
+            if (grad && fgColor == 0xFFFFFFFF && fgColor2 == 0) {
+                for (int i = 0; i < 5; i++) {
+                    float y0 = floorf(pos.y + size.y * i / 5.0f);
+                    float y1 = floorf(pos.y + size.y * (i + 1) / 5.0f);
+                    if (y1 > y0) {
+                        mesh->addDynBar(whiteSprite, vec2(pos.x, y0), vec2(size.x * value, y1 - y0), grad[i]);
+                    }
+                }
+                return;
+            }
+        #endif
             mesh->addDynBar(CommonTex[type], pos, vec2(size.x * value, size.y), fgColor, fgColor2);
+        }
     }
 
     void renderHelp() {

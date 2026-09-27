@@ -1051,6 +1051,9 @@ struct Level : IGame {
     }
 
     virtual ~Level() {
+    #ifdef _GAPI_SW
+        GAPI::swDrain();
+    #endif
         UI::init(NULL);
 
         Network::stop();
@@ -1869,6 +1872,37 @@ struct Level : IGame {
     }
 
     void renderSky() {
+    #ifdef _GAPI_SW
+        // TR2/TR3 skies are a textured model around the camera (TR1 has none:
+        // its black backdrop is original). The software renderer draws it
+        // first, without depth, as a backdrop the level then covers (see
+        // renderOpaque), and without fog or far clipping (swSkyBatch).
+        if (!(level.version & TR::VER_TR1) && level.extra.sky != -1) {
+            Core::Pass pass = Core::pass;
+            mat4 mView = Core::mView;
+            mat4 mProj = Core::mProj;
+
+            Core::mView.setPos(vec3(0));
+            Core::setViewProj(Core::mView, Core::mProj);
+            setShader(Core::passSky, Shader::DEFAULT, false, false);
+            GAPI::setPalette(GAPI::swPaletteColor);   // not whichever room palette came last
+            Core::setDepthTest(false);
+            Core::setDepthWrite(false);
+
+            GAPI::swSkyBatch = true;
+            Basis b;
+            b.identity();   // Basis() leaves w unset, and renderModel skips parts with w == 0
+            Core::setBasis(&b, 1);
+            mesh->renderModel(level.extra.sky);
+            GAPI::swSkyBatch = false;
+
+            Core::setDepthTest(true);
+            Core::setDepthWrite(true);
+            Core::setViewProj(mView, mProj);
+            Core::pass = pass;
+        }
+        return;
+    #endif
         #if !defined(_GAPI_GL) && !defined(_GAPI_D3D11)
             return;
         #endif
@@ -2435,6 +2469,15 @@ struct Level : IGame {
                     b.rot = quat(0, 0, 0, 1);
                 #endif
                 Core::setBasis(&b, 1);
+            #ifdef FFP
+                // see Controller::renderSprite: fixed-function renderers place
+                // the queue with mModel, and need the sprites' tile back
+                Core::mModel.identity();
+                Core::mModel.setPos(Core::viewPos.xyz());
+                if (mesh->curTile != 0xFFFF) {
+                    atlasSprites->bindTile(mesh->curTile, mesh->curClut);
+                }
+            #endif
             }
 
             mesh->dynEnd();
@@ -2590,11 +2633,20 @@ struct Level : IGame {
     }
 
     void renderOpaque(RoomDesc *roomsList, int roomsCount) {
+    #ifdef _GAPI_SW
+        // software renderer: the sky goes first, as a backdrop without depth
+        if (Core::pass != Core::passShadow && skyIsVisible) {
+            renderSky();
+        }
+        renderRooms(roomsList, roomsCount, 0);
+        renderEntities(0);
+    #else
         renderRooms(roomsList, roomsCount, 0);
         renderEntities(0);
         if (Core::pass != Core::passShadow && skyIsVisible) {
             renderSky();
         }
+    #endif
     }
 
     void renderTransparent(RoomDesc *roomsList, int roomsCount) {
@@ -2695,6 +2747,11 @@ struct Level : IGame {
             setupBinding();
         }
 
+    #ifdef _GAPI_SW
+        GAPI::swUnderwater = camera->isUnderwater();
+        GAPI::swWaterTime  = float(osGetTimeMS() % 1000000) * 0.001f;
+        GAPI::swShadeDirty = true;
+    #endif
         prepareRooms(roomsList, roomsCount);
 
         renderOpaque(roomsList, roomsCount);

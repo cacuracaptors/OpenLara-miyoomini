@@ -310,6 +310,13 @@ struct Inventory {
                 default                              : desc = Desc( STR_UNKNOWN,         PAGE_ITEMS,     -1                               ); break;
             }
 
+            // Guard against levels whose model list is missing or smaller than
+            // the index the item expects (TR2's title crashed here, on a NULL
+            // model list). An invalid model makes add() drop the item instead.
+            if (desc.model > -1 && (!level->models || !(desc.model < int(level->modelsCount)))) {
+                fprintf(stderr, "inventory: item %d has no model %d (models=%p)\n", int(type), desc.model, (void*)level->models);
+                desc.model = -1;
+            }
             if (desc.model > -1 && level->models[desc.model].animation != 0xFFFF) {
                 anim = new Animation(level, &level->models[desc.model]);
                 anim->isEnded = true;
@@ -1716,6 +1723,46 @@ struct Inventory {
     }
 
     void renderTitleBG(float sx = 1.0f, float sy = 1.0f, uint8 alpha = 255, float cropW = 1.0f, float cropH = 1.0f) {
+    #ifdef _GAPI_SW
+        // The software rasterizer only samples 8-bit palettized tiles; its
+        // DIP() gives up on regular RGBA textures (a "TODO" upstream), so the
+        // menu's title picture was never drawn. Blit it straight into the
+        // 16-bit color buffer instead, scaled to the screen, before the ring
+        // items are rendered on top. Render targets are skipped: this backend
+        // never fills them, so their memory holds no valid picture.
+        // The core defers render-target switches and their clears until the
+        // next draw call. This blit bypasses draw calls, so without this the
+        // pending clear would run at the first ring item and wipe the picture.
+        Core::validateRenderState();
+        if (background[0] && background[0]->memory && !(background[0]->opt & OPT_TARGET)) {
+            Texture *tex = background[0];
+            // Same fit as the GL path below: optional centered crop (cropW/H,
+            // used for PSX videos), sx/sy aspect correction (e.g. 1.2 for TR1
+            // FMVs), then letterbox or pillarbox to the screen with black bars.
+            float cropSrcW = float(tex->origWidth)  * cropW;
+            float cropSrcH = float(tex->origHeight) * cropH;
+            int srcX0 = int(0.5f * (float(tex->origWidth)  - cropSrcW));
+            int srcY0 = int(0.5f * (float(tex->origHeight) - cropSrcH));
+            int srcW  = max(1, int(cropSrcW));
+            int srcH  = max(1, int(cropSrcH));
+
+            float fitAspect = ((sx * cropSrcW) / (sy * cropSrcH)) /
+                              (float(Core::width) / float(Core::height) * Core::aspectFix);
+            int outW = Core::width;
+            int outH = Core::height;
+            if (fitAspect < 1.0f) {
+                outW = max(1, int(float(Core::width) * fitAspect));
+            } else {
+                outH = max(1, int(float(Core::height) / fitAspect));
+            }
+            int outX0 = (Core::width  - outW) / 2;
+            int outY0 = (Core::height - outH) / 2;
+
+            GAPI::swRecordBlit(tex, srcX0, srcY0, srcW, srcH, outX0, outY0, outW, outH);
+        }
+        return;
+    #endif
+
         float aspectSrc, ax, ay, tx, ty;
 
         if (background[0]) {

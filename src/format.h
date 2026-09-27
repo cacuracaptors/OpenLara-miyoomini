@@ -3212,8 +3212,11 @@ namespace TR {
             }
 
         #ifdef _GAPI_SW
-            ASSERT((version & VER_TR1_PC) == VER_TR1_PC);
-            if ((version & VER_TR1_PC) != VER_TR1_PC) {
+            // Upstream limited the software renderer to TR1. TR2 PC levels also
+            // ship 8-bit palettized textures, a palette and a light map (see
+            // loadTR2_PC), which is all this renderer needs, so allow them too.
+            if ((version & VER_TR1_PC) != VER_TR1_PC && (version & VER_TR2_PC) != VER_TR2_PC &&
+                (version & VER_TR3_PC) != VER_TR3_PC) {
                 return;
             }
         #endif
@@ -4699,7 +4702,22 @@ namespace TR {
         }
 
         void prepare() {
+            // TR2 PC keeps its 8-bit palette in the same DOS 6-bit format.
+            // GL never uses it (TR2 has 16-bit textures), but the software
+            // renderer draws with it, so convert it too - otherwise every
+            // colour came out at a quarter of its brightness.
+        #ifdef _GAPI_SW
+            // Decide from the data rather than the version: convert when no
+            // component exceeds the DOS 6-bit range, so a palette that is
+            // already 8-bit is never wrapped around.
+            bool palette6bit = (palette != NULL);
+            for (int i = 0; palette6bit && i < 256; i++) {
+                if (palette[i].r > 63 || palette[i].g > 63 || palette[i].b > 63) palette6bit = false;
+            }
+            if (palette6bit && (version == VER_TR1_PC || version == VER_TR2_PC || version == VER_TR3_PC)) {
+        #else
             if (version == VER_TR1_PC) {
+        #endif
             // DOS 6-bit -> 8-bit per component
                 ASSERT(palette);
                 Color24 *c = palette;
@@ -6528,7 +6546,17 @@ namespace TR {
                         return palette[texture & 0xFF];
                     #endif
                 case VER_TR2_PC  :
-                case VER_TR3_PC  : return palette32[(texture >> 8) & 0xFF];
+                case VER_TR3_PC  :
+                    #ifdef _GAPI_SW
+                        // The low byte indexes the 8-bit palette (the high byte the
+                        // 16-bit one). The software renderer needs the palette index
+                        // plus its 142 marker, as for TR1: without it these faces
+                        // (most of Lara's braid, the TR2 sky...) were read as
+                        // textured and came out invisible or black.
+                        return Color32(texture & 0xFF, 0, 0, 142);
+                    #else
+                        return palette32[(texture >> 8) & 0xFF];
+                    #endif
                 case VER_TR1_PSX : 
                 case VER_TR2_PSX : 
                 case VER_TR3_PSX : {
@@ -6716,6 +6744,51 @@ namespace TR {
             return room.sectors[sectorIndex = (x * room.zSectors + z)];
         }
         
+        // TR3 "no collision" split sectors: a floor or ceiling divided along a
+        // diagonal, one triangle being a portal to the room below/above and the
+        // other solid. The original game (GetFloor/GetHeight/GetCeiling with
+        // CheckNoColFloorTriangle / CheckNoColCeilingTriangle) only follows the
+        // portal inside the open triangle; OpenLara followed it everywhere, so
+        // over the solid half it measured heights in the wrong room - Lara got
+        // stuck on thin air under TR3's jungle root arch, but not along its
+        // other half. These tell whether (x, z) lies on the solid triangle.
+        bool isSolidFloorTriangle(const Room::Sector *s, int x, int z) const {
+            if (!s->floorIndex) return false;
+            const int func = floors[s->floorIndex].cmd.func;
+            x &= 1023;
+            z &= 1023;
+            switch (func) {
+                case FloorData::FLOOR_NW_SE_PORTAL_SE : return !(x <= 1024 - z);
+                case FloorData::FLOOR_NW_SE_PORTAL_NW : return !(x >  1024 - z);
+                case FloorData::FLOOR_NE_SW_PORTAL_SW : return !(x <= z);
+                case FloorData::FLOOR_NE_SW_PORTAL_NE : return !(x >  z);
+                default : return false;
+            }
+        }
+
+        bool isSolidCeilingTriangle(const Room::Sector *s, int x, int z) const {
+            if (!s->floorIndex) return false;
+            const FloorData *fd = &floors[s->floorIndex];
+            int func = fd->cmd.func;
+            // the ceiling command follows the floor one (command + data word)
+            if (func == FloorData::FLOOR ||
+                (func >= FloorData::FLOOR_NW_SE_SOLID     && func <= FloorData::FLOOR_NE_SW_SOLID) ||
+                (func >= FloorData::FLOOR_NW_SE_PORTAL_SE && func <= FloorData::FLOOR_NE_SW_PORTAL_NE)) {
+                if (fd->cmd.end) return false;
+                fd  += 2;
+                func = fd->cmd.func;
+            }
+            x &= 1023;
+            z &= 1023;
+            switch (func) {
+                case FloorData::CEILING_NW_SE_PORTAL_SE : return !(x <= 1024 - z);
+                case FloorData::CEILING_NW_SE_PORTAL_NW : return !(x >  1024 - z);
+                case FloorData::CEILING_NE_SW_PORTAL_SW : return !(x <= z);
+                case FloorData::CEILING_NE_SW_PORTAL_NE : return !(x >  z);
+                default : return false;
+            }
+        }
+
         Room::Sector* getSector(int16 &roomIndex, const vec3 &pos) {
             ASSERT(roomIndex >= 0 && roomIndex <= roomsCount);
 
@@ -6744,12 +6817,12 @@ namespace TR {
             };
 
         // check vertical
-            while (sector->roomAbove != NO_ROOM && y < sector->ceiling * 256) {
+            while (sector->roomAbove != NO_ROOM && y < sector->ceiling * 256 && !isSolidCeilingTriangle(sector, x, z)) {
                 Room &room = rooms[roomIndex = sector->roomAbove];
                 sector = room.getSector((x - room.info.x) / 1024, (z - room.info.z) / 1024);
             }
 
-            while (sector->roomBelow != NO_ROOM && y >= sector->floor * 256) {
+            while (sector->roomBelow != NO_ROOM && y >= sector->floor * 256 && !isSolidFloorTriangle(sector, x, z)) {
                 Room &room = rooms[roomIndex = sector->roomBelow];
                 sector = room.getSector((x - room.info.x) / 1024, (z - room.info.z) / 1024);
             }
@@ -6763,7 +6836,7 @@ namespace TR {
             int dx = x & 1023;
             int dz = z & 1023;
 
-            while (sector->roomBelow != NO_ROOM) {
+            while (sector->roomBelow != NO_ROOM && !isSolidFloorTriangle(sector, x, z)) {
                 Room &room = rooms[sector->roomBelow];
                 if (roomIndex)
                     *roomIndex = sector->roomBelow;
@@ -6852,7 +6925,7 @@ namespace TR {
             int dz = z & 1023;
 
             ASSERT(sector);
-            while (sector->roomAbove != NO_ROOM) {
+            while (sector->roomAbove != NO_ROOM && !isSolidCeilingTriangle(sector, x, z)) {
                 Room &room = rooms[sector->roomAbove];
                 sector = room.getSector((x - room.info.x) / 1024, (z - room.info.z) / 1024);
             }

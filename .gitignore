@@ -1,0 +1,4 @@
+
+# Miyoo Mini port: build output and backups
+bin/
+*.orig

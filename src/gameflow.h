@@ -1276,13 +1276,18 @@ namespace TR {
                 case VER_TR1_SAT :
                 case VER_TR1_PC  :
                 case VER_TR1_PSX :
-                    sprintf(title, "track_%02d", track);
+                    sprintf(title, "track_%02d", track);   // PSX numbering (full soundtrack packs)
                     if (!checkTrack("", title) && !checkTrack("audio/1/", title) && !checkTrack("audio/", title)) {
+                        // The PC CD has only 9 tracks: map the PSX number onto them
+                        // (cutscenes 22-25 are PC tracks 7-10)
                         track = remapTrack(version, track);
                         sprintf(title, "%03d", track);
                         if (!checkTrack("", title) && !checkTrack("audio/1/", title) && !checkTrack("audio/", title)) {
-                            callback(NULL, userData);
-                            return;
+                            sprintf(title, "%02d", track);   // GOG/Steam: 02.mp3 ... 10.mp3, PC numbering
+                            if (!checkTrack("", title)) {
+                                callback(NULL, userData);
+                                return;
+                            }
                         }
                     }
                     break;
@@ -1295,8 +1300,11 @@ namespace TR {
                     track = remapTrack(version, track);
                     sprintf(title, "track_%02d", track);
                     if (!checkTrack("", title) && !checkTrack("audio/2/", title) && !checkTrack("audio/", title)) {
-                        callback(NULL, userData);
-                        return;
+                        sprintf(title, "Track%02d", track);   // GOG: music/Track02.ogg ...
+                        if (!checkTrack("music/", title)) {
+                            callback(NULL, userData);
+                            return;
+                        }
                     }
                     break;
                 case VER_TR3_PC  :
