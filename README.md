@@ -1,249 +1,188 @@
-# Fallout 2 - Miyoo Mini Plus / OnionOS Port
+# Tomb Raider (OpenLara) - Miyoo Mini Plus / OnionOS Port
 
-This is a port of [**FOR:CE**](https://github.com/fallout2-ce/fallout2-ce) - the actively maintained
-Fallout 2 community engine fork - to the **Miyoo Mini Plus** handheld running **OnionOS**.
+This is a port of [**OpenLara**](https://github.com/XProger/OpenLara) - the open-source reimplementation of the
+classic Tomb Raider engine by Timur "XProger" Gagiev - to the **Miyoo Mini Plus** handheld running **OnionOS**.
 
-Unlike a straightforward port of the original 1998 game, this build inherits everything FOR:CE offers:
-native mod support (including the [Restoration Project](https://github.com/BGforgeNet/Fallout2_Restoration_Project)),
-a built-in sfall-compatible scripting engine, dozens of quality-of-life settings, and many bug fixes over
-vanilla Fallout 2 - all running natively on ARM, with a full D-pad/button control scheme and an on-device
-text entry system for typing.
+The Miyoo Mini Plus has no 3D GPU, so this port runs on OpenLara's software renderer, which was largely
+rebuilt for it: precise, perspective-correct and spread over both CPU cores. This release plays the original
+**Tomb Raider (1996)**; the engine and folder layout are ready for more games in future updates.
+
+**[Download the latest release](https://github.com/cacuracaptors/OpenLara-miyoomini/releases)**
 
 ## OnionOS Exclusive Features
 
-- Runs at full speed, no overclock needed
-- Software rendering (the Miyoo Mini Plus has no 3D GPU)
-- A full control scheme adapted for the Miyoo Mini Plus' hardware, which has no analog sticks
-  (see [Controls](#controls))
-- The D-pad acts as a mouse cursor
-- A custom on-device text entry system (D-pad + buttons) for naming your character, save games,
-  etc., since the device has no physical keyboard
-- Working audio and video, including cutscenes
-
-## Quality of life benefits over vanilla Fallout 2
-
-- Party members can loot and barter in place of PC
-- Directly equip party members instead of convincing them to use the right equipment
-- Press L2, quickly, to move items when bartering, looting, or stealing, and auto-balance caps
-- Music continues playing between maps
-- Auto open doors
-- Integrated "HELP" menu (with a Miyoo-specific control reference screen)
-
-[![In-game Quick Guide showing the Miyoo Mini Plus control scheme](https://github.com/cacuracaptors/fallout2-ce-miyoomini/raw/main/docs/images/quick-guide.png)](/cacuracaptors/fallout2-ce-miyoomini/blob/main/docs/images/quick-guide.png)
-The in-game "Quick Guide" help screen, replaced with the Miyoo Mini Plus control scheme
-
-- Last used save slot is remembered
-- You can cancel elevator floor selection using the Menu key
-- Item/Corpse/Container/Critter highlighting
-- Dozens of small things that just work a little better than they did in the original - better
-  pathfinding, fewer graphics glitches, less finicky weapon stacking, and much more
-
-> **Note:** A few FOR:CE features that require a screen wider/taller than 640x480 (the 2-column
-> inventory, the 4-row barter screen, and other high-resolution UI layouts) are not available on this
-> handheld's fixed resolution. Everything else works normally.
-
-CE has broad (though not total) compatibility with [Sfall](https://github.com/sfall-team/sfall) scripting extensions. Many traditional Fallout mods work out of the box. See [SFALL_COMPATIBILITY.md](https://github.com/cacuracaptors/fallout2-ce-miyoomini/blob/main/SFALL_COMPATIBILITY.md) for the current compatibility status.
+- Native 640x480, no overclock needed
+- A rebuilt software renderer:
+  - perspective-correct textures and sub-pixel precise triangles: no PS1-style warping textures, wobbling
+    vertices or cracks between polygons
+  - a proper depth buffer, so objects no longer show through each other
+  - rendering pipelined over both CPU cores
+  - water as in the original DOS game: what is underwater is tinted blue and its light shimmers, seen from
+    inside or outside the water, and the scene sways gently when the camera dives
+  - effects that were invisible in OpenLara's software renderers: bubbles, bullet sparks, blood, splashes,
+    smoke, flames and lava sparks
+  - translucent menus and working health and air bars
+- Easy installation: just copy the files from the GOG version. The game data is extracted from `GAME.GOG`
+  automatically on the first start, with a progress screen
+- Music with the GOG file names, as they come (no renaming), including the cutscene audio
+- A full PS1-style control scheme adapted to the Miyoo Mini Plus buttons
+- Quick save and quick load shortcuts
+- Frame rate capped at 60 FPS, the screen's refresh rate
 
 ## Installation
 
-1. Download the latest release from the [Releases page](https://github.com/cacuracaptors/fallout2-ce-miyoomini/releases).
-2. Extract its contents to the root of your OnionOS SD card (this places `Fallout 2` in `Roms/PORTS/Games/`, and the shortcut + icon in `Roms/PORTS/`).
-3. You need your own legitimate copy of Fallout 2's data files. Copy these into the `Fallout 2` game
-   folder on the SD card:
-   - `master.dat`
-   - `critter.dat`
-   - `data/`
+1. Download the release zip and extract it to the root of your OnionOS SD card. This places the `OpenLara`
+   folder in `Roms/PORTS/Games/`, and the shortcut and its image in `Roms/PORTS/Shortcuts/` and
+   `Roms/PORTS/Imgs/`.
+2. You need your own legitimate copy of Tomb Raider, in the **GOG version**: the
+   [Tomb Raider 1+2+3](https://www.gog.com/en/game/tomb_raider_123) pack. From its `Tomb Raider 1`
+   installation folder, copy into `Roms/PORTS/Games/OpenLara/Tomb Raider 1/`:
+   - `GAME.GOG` (required - the game data)
+   - `02.mp3` to `10.mp3` (optional - the music)
 
-> **If you have a previous 1.0.0 release of this port installed:** delete all files from the old `Fallout 2` game folder first. That version was built on a different, unmaintained fork, and mixing
-> old and new files will cause problems.
+   To find that folder in GOG Galaxy: select the game, click the settings button next to "Play", then
+   "Manage installation" > "Show folder".
+3. On OnionOS, open **Tomb Raider** from the Ports list (use "Refresh roms" at the bottom of the list if it
+   doesn't show up).
 
-> **Important:** do not copy a `fallout2.cfg` from your own installation into the game folder, and
-> delete one if it's already there. This port generates its own `fallout2.cfg` tuned for this
-> hardware - overwriting it with a standard PC one will break the game.
+The first start copies the game data out of `GAME.GOG`. It takes about a minute, shows a progress screen, and
+only happens once: `GAME.GOG` is removed at the end. It needs about 170 MB of free space on the SD card (on top
+of `GAME.GOG` itself); if there isn't enough, the screen says how much is needed.
 
-## Installing with the Restoration Project (RPU) - optional
-
-This port fully supports the [Restoration Project](https://github.com/BGforgeNet/Fallout2_Restoration_Project) mod, which restores a large amount of cut content - dozens of previously unused areas, quests, and
-characters, new companions and expanded dialogue, and many bug fixes beyond what the base engine
-already fixes.
-
-> **Important:** if you install RPU on top of an existing save, or add it to this port after already
-> starting to play, your old saves will not work correctly. **You must start a new game after
-> installing RPU.** This isn't specific to this port - it's true of RPU on any platform.
-
-To install it:
-
-1. On a PC, install Fallout 2 normally.
-2. Run the RPU installer on top of that same installation.
-3. Copy **all** files from that installed folder into the `Fallout 2` game folder on your SD card,
-   overwriting when prompted. This includes `master.dat`, `critter.dat`, `ce.dat`, `mods/`, `data/` -
-   everything. Since it's hard to know in advance exactly which files RPU needs, copying everything over
-   is the simplest way to make sure nothing is missing. As above, delete any `fallout2.cfg` that comes
-   along with it.
-
-You don't need to do anything else - this port automatically detects and uses RPU if it's present, and
-works fine without it if you skip this section entirely. Other mods that don't rely on a Windows-only `ddraw.dll` (Nevada, Sonora, Party Orders, NPC Armor, and more) should work the same way: drop the mod's
-files into the `mods/` folder and list it in `mods/mods_order.txt`.
-
-## Configuring quality-of-life settings
-
-Many of the improvements this fork adds over the original game (auto-opening doors, faster ammo
-loading, and dozens more) are off by default and need to be turned on by editing `fallout2.cfg` by
-hand, the same way you would on PC. Open `fallout2.cfg` in a text editor and change the value after
-the `=` sign. For example, to enable auto-opening doors, find this line under the `[ui]` section:
-
-```
-auto_open_doors=0
-```
-
-...and change it to:
-
-```
-auto_open_doors=1
-```
-
-The same applies to most other settings in that file - `0` is off, `1` is on (a few settings use other
-small numbers for different modes; more details in the [FOR:CE](https://github.com/fallout2-ce/fallout2-ce) repository.
+**Original CD:** copy the `DATA` folder (required) and the `FMV` folder (optional - the videos) into the same
+folder instead of `GAME.GOG`.
 
 ## Controls
 
-| Button   | Without Select                  | With Select held        |
-| -------- | -------------------------------- | ------------------------ |
-| D-pad    | Mouse movement                  | Camera scroll           |
-| A        | Attack                          | Skilldex                |
-| B        | End turn                        | Character               |
-| X        | Slow mouse (hold)               | Inventory               |
-| Y        | End combat                      | Pip-Boy                 |
-| L1       | Right click                     | Quickload                |
-| R1       | Left click                      | Quicksave                |
-| L2       | Switch active item              | Automap                 |
-| R2       | Switch item mode                | Center camera on player |
-| Start    | Enter / OK                      | -                        |
-| Select   | *(modifier)*                    | -                        |
-| Menu key | Esc / Exit / Return / Open Menu | -                        |
+| Button | Action |
+|---|---|
+| D-pad | Move |
+| B | Jump |
+| Y | Action (shoot, grab, pick up, use) / confirm in menus |
+| A | Roll |
+| X | Draw / holster weapons |
+| L1 (hold) | Look around with the D-pad |
+| R1 (hold) | Walk |
+| L2 / R2 | Sidestep left / right |
+| Select / Start | Inventory (pause) |
+| Menu + R1 | Quick save |
+| Menu + L1 | Quick load |
 
-The Menu key fires Esc on **release**, not on press - this means the OnionOS Menu+Power screenshot
-combo won't accidentally exit the game before you can take the screenshot.
+To exit the game, open the passport in the inventory and choose "Exit Game". The Menu key alone does nothing,
+so the OnionOS Menu+Power screenshot combo is safe to use at any time.
 
-### Typing text (character name, save names, etc.)
+## Cheats
 
-Since the device has no keyboard, text entry works by cycling through letters directly in the game's
-own text field, the same system used in our [Fallout (1997) port](https://github.com/cacuracaptors/fallout1-ce-miyoomini):
+OpenLara's built-in cheats work during gameplay. Press the buttons one at a time, without touching the D-pad
+in between:
 
-- **D-pad Up/Down**: cycles through the alphabet/numbers/space at the current position
-- **D-pad Left**: toggles uppercase/lowercase for the current letter
-- **D-pad Right**: inserts a space directly and moves to the next position
-- **A**: confirms the current letter and moves to the next position
-- **B**: deletes the last confirmed letter
-- **Start**: confirms the whole text entry (Enter)
-- **Menu key**: cancels the whole text entry (Esc)
+| Sequence | Effect |
+|---|---|
+| X, L1, X, L1, X, L1, X, L1 | All weapons with ammo (Lara screams) |
+| B, L1, B, L1, B, L1, B, L1 | Skip to the next level |
+| R1, L1, R1, L1, R1, L1, R1, L1 | Fly mode: Lara swims through the air and takes no damage. Press R1 to land (careful: from high up she falls!) |
 
-A Miyoo-specific "Quick Guide" screen with this same control scheme (pictured above) is available from
-the Options menu at any time in-game.
+They don't work in Lara's Home, in cutscenes or on the title screen.
 
 ## Known issues
 
-- Audio has a noticeable, constant latency, the same underlying hardware limitation documented in our
-  Fallout (1997) port.
-- The mouse cursor moves noticeably slower on screens with an open text field (character creation,
-  save/load naming, etc.).
+- The PC version of Tomb Raider has 9 music tracks (the menu theme, the ambient themes and the cutscenes); the
+  in-level music of the PlayStation version was never part of it.
+- Large, busy areas may run below 60 FPS.
+- Tomb Raider 2 and 3 are not supported yet: OpenLara's support for them is still incomplete (most Tomb
+  Raider 2 enemies have no AI, and climbing walls is not implemented). They are planned for future updates.
+- If the game crashes, a `crash_log.txt` file is created in the `Tomb Raider 1` folder - please attach it to
+  your report. The game's log is in `log.txt`, in the same folder.
+
+## Changelog
+
+- **v1.0.0** - Initial release: Tomb Raider 1.
 
 ## Building from source
 
-This port requires cross-compiling for ARMv7 hard-float using a Docker-based toolchain. Tested
-on Windows + WSL2 + Docker Desktop.
+This port cross-compiles for ARMv7 hard-float with a Docker-based toolchain. Tested on Windows + WSL2 + Docker
+Desktop.
 
 ### Prerequisites
 
-- WSL2 with Ubuntu, and Docker Desktop with WSL integration enabled.
+- WSL2 with Ubuntu, and Docker Desktop with WSL integration enabled
+- The [union-miyoomini-toolchain](https://github.com/shauninman/union-miyoomini-toolchain) container
+- A Miyoo Mini buildroot sysroot providing SDL 1.2, expected at
+  `/root/workspace/mini/arm-buildroot-linux-gnueabihf/sysroot` inside the container
+- [steward-fu/sdl2](https://github.com/steward-fu/sdl2) at `/root/workspace/sdl2-miyoo`, for the Miyoo Mini
+  audio (MI_AO) headers and libraries in `mini/inc` and `mini/lib`
 
 ### Steps
 
-```
-mkdir -p ~/fallout-miyoo && cd ~/fallout-miyoo
+Inside the toolchain container, with this repository at `/root/workspace/OpenLara`:
 
-# Cross toolchain
-git clone https://github.com/shauninman/union-miyoomini-toolchain.git
-
-# SDL2 ported for the Miyoo Mini (Plus)
-git clone https://github.com/steward-fu/sdl2.git sdl2-miyoo
-
-# This repository (already patched)
-git clone https://github.com/cacuracaptors/fallout2-ce-miyoomini.git fallout2-ce-new
+```bash
+cd /root/workspace/OpenLara/src/platform/bittboy
+./build_miyoomini.sh
 ```
 
-**1) Build the Miyoo Mini SDL2** (inside `sdl2-miyoo`, via Docker - see the [steward-fu/sdl2](https://github.com/steward-fu/sdl2) instructions for the full `make cfg && make gpu && make sdl2` process). No patches are needed here - this port builds
-against a completely unmodified copy of `steward-fu/sdl2`.
+This produces two binaries in `bin/`: `OpenLara-sw-debug` (with symbols, for `addr2line` on crash reports)
+and `OpenLara-sw` (stripped: the one shipped as `OpenLara` in the release). The release also ships
+`libSDL-1.2.so.0` from the sysroot.
 
-**2) Build fallout2-ce** using the cross toolchain:
+### What this fork changes (compared to upstream XProger/OpenLara)
 
-```
-cd union-miyoomini-toolchain
-make shell
-```
-
-Inside the container, the bzip2 headers/symlink and git's `safe.directory` need to be set up once
-per container session (the container is ephemeral, so this doesn't persist between runs):
-
-```
-ln -sf /opt/miyoomini-toolchain/arm-linux-gnueabihf/libc/usr/lib/libbz2.so.1.0.6 /opt/miyoomini-toolchain/arm-linux-gnueabihf/libc/usr/lib/libbz2.so
-wget -O /opt/miyoomini-toolchain/arm-linux-gnueabihf/libc/usr/include/bzlib.h https://raw.githubusercontent.com/libarchive/bzip2/master/bzlib.h
-
-git config --global --add safe.directory /root/workspace/fallout2-ce-new
-```
-
-Then configure and build:
-
-```
-cd ~/workspace/fallout2-ce-new
-
-cmake -B build \
-  -DCMAKE_TOOLCHAIN_FILE=toolchain-miyoomini.cmake \
-  -DCMAKE_MODULE_PATH=$(pwd)/cmake_miyoo \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFALLOUT_VENDORED=OFF \
-  -DSDL2_INCLUDE_DIR=/root/workspace/sdl2-miyoo/sdl2/include \
-  -DSDL2_LIBRARY=/root/workspace/sdl2-miyoo/sdl2/build/.libs/libSDL2.so \
-  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-shlib-undefined" \
-  -DCMAKE_CXX_STANDARD_LIBRARIES="-lstdc++fs"
-
-cmake --build build -j4 --target fallout2-ce
-```
-
-(`-lstdc++fs` has to go through `CMAKE_CXX_STANDARD_LIBRARIES`, not `CMAKE_EXE_LINKER_FLAGS`, because
-GCC 8's `std::filesystem` symbols need it placed after the object files on the link line, and
-`CMAKE_CXX_STANDARD_LIBRARIES` is what CMake appends at the very end.)
-
-The final ARM (armhf) binary `fallout2-ce` will be in `build/`.
-
-### What this fork changes (compared to upstream fallout2-ce/fallout2-ce)
-
-- **`src/dinput.cc`** - makes mouse "relative mode" initialization non-fatal (this device's SDL2
-  build doesn't implement it, and this fork treats that failure as fatal by default) and adds
-  D-pad-as-mouse-cursor movement.
-- **`src/input.cc`** - the full physical-button-to-game-action remapping, the Select-modifier layer,
-  the on-device text entry system, key-repeat debounce for this hardware's key delivery quirks, and
-  makes the Menu key's Esc action fire on key-release instead of key-press (so the OnionOS Menu+Power
-  screenshot combo doesn't exit the game before Power can be pressed) - all layered on top of, not
-  replacing, this fork's own sfall key-hook system.
-- **`src/debug.cc`** - `debugPrint()` only logged through `SDL_Log` in debug builds upstream, which
-  meant this fork's own `showMessageBox()` calls (used for fatal startup errors) were silently
-  swallowed in a release build, since this hardware's SDL2 driver doesn't implement message boxes
-  either. Logging is now unconditional.
-- **`data/art/intrface/helpscrn.frm`** (+ matching `.pal`) - a Miyoo Mini-specific replacement for
-  the in-game "Quick Guide" screen (pictured above), shown in place of the PC keyboard reference this
-  fork normally ships (or the one added by RPU, if installed) via this engine's `master_patches`
-  folder, which always takes priority over both `master.dat` and any mod.
-- **`toolchain-miyoomini.cmake`, `cmake_miyoo/FindSDL2.cmake`** - cross-compilation setup for this
-  hardware's ARMv7 hard-float toolchain.
+- **`src/gapi/sw.h`** - the software renderer: exact sub-pixel triangle rasterizer (top-left fill rule, plane
+  equations), 16-bit depth buffer, perspective-correct texturing, near-plane clipping, an exact backface
+  test, a frame recorder that rasterizes on the second core while the first prepares the next frame, 2D UI
+  with translucency, and the per-room underwater palette and light shimmer
+- **`src/level.h`**, **`src/controller.h`** - effect sprites placed correctly in fixed-function renderers,
+  per-room water palette, sky backdrop for the software renderer
+- **`src/gameflow.h`** - TR1 music mapped onto the 9 PC CD tracks, GOG file names accepted
+- **`src/sound.h`** - MP3/OGG decoder fixes (buffered PCM, stereo output)
+- **`src/format.h`**, **`src/collision.h`**, **`src/utils.h`**, **`src/ui.h`**, **`src/inventory.h`** - case-insensitive file
+  lookup, video frames, palette handling and fixes for later games' data
+- **`src/platform/bittboy/`** - the Miyoo Mini platform: SDL 1.2 video with the 180-degree panel rotation,
+  MI_AO audio, controls, crash handler (`crash_handler.cc`), first-run extraction of `DATA`/`FMV` from the
+  GOG CD image with a progress screen (`cdextract.h`), and the build script
 
 ## Credits
 
-- [fallout2-ce/fallout2-ce (FOR:CE)](https://github.com/fallout2-ce/fallout2-ce)
-- Original fallout2-ce by Alexander Batalov
-- [Restoration Project (RPU)](https://github.com/BGforgeNet/Fallout2_Restoration_Project) by the BGforgeNet community
-- Miyoo Mini Plus SDL2 driver by Steward Fu
+- OpenLara by Timur "XProger" Gagiev - https://github.com/XProger/OpenLara
+- Miyoo Mini audio output (MI_AO) based on Steward Fu's SDL2 port - https://github.com/steward-fu/sdl2
+- Miyoo Mini toolchain by Shaun Inman - https://github.com/shauninman/union-miyoomini-toolchain
+- Setup screen text in DejaVu Sans Mono - https://dejavu-fonts.github.io
+- Original Tomb Raider (1996) by Core Design / Eidos Interactive
+- Miyoo Mini Plus port by [cacuracaptors](https://github.com/cacuracaptors)
 
 ## License
 
-The source code in this repository is available under the [Sustainable Use License](https://github.com/cacuracaptors/fallout2-ce-miyoomini/blob/main/LICENSE.md).
+OpenLara is distributed under the BSD 2-Clause License (see [LICENSE](LICENSE)). Tomb Raider and Lara Croft
+are trademarks of their respective owners; no game data is included - you need your own copy of the game.
+
+---
+
+*The original OpenLara README follows.*
+
+# OpenLara
+Classic Tomb Raider open-source engine
+
+[WebGL build with demo level](http://xproger.info/projects/OpenLara/)
+
+[Standalone version](https://github.com/XProger/OpenLara/releases/tag/latest)
+
+[Roadmap](https://github.com/XProger/OpenLara/issues/353)
+
+[![License](https://img.shields.io/badge/License-BSD%202--Clause-orange.svg)](https://opensource.org/licenses/BSD-2-Clause)  
+
+## Links
+[![Twitter](https://badgen.net/badge/icon/twitter?icon=twitter&label)](https://twitter.com/XProger_san)
+[![Discord](https://badgen.net/badge/icon/discord?icon=discord&label)](https://discord.gg/EF8JaQB)
+[![Telegram](https://badgen.net/badge/icon/telegram?icon=telegram&label)](https://t.me/openlara)
+* [YouTube channel](https://www.youtube.com/c/TimurGagiev)
+* [Tomb Raider Forums thread](http://www.tombraiderforums.com/showthread.php?t=216618)
+
+## Screenshots
+![Waterfall](http://xproger.info/projects/OpenLara/shots/waterfall.jpg)
+![Double-aim](http://xproger.info/projects/OpenLara/shots/multi-aim.jpg)
+![Caustics](http://xproger.info/projects/OpenLara/shots/caustics.jpg)
+![Cutscene](http://xproger.info/projects/OpenLara/shots/cut1.jpg)
+![Cistern](http://xproger.info/projects/OpenLara/shots/flipmap.jpg)
+![Opera](http://xproger.info/projects/OpenLara/shots/tr2_opera.jpg)
+![Unwater](http://xproger.info/projects/OpenLara/shots/tr2_unwater1.jpg)
+![Temple](http://xproger.info/projects/OpenLara/shots/tr3_temple.jpg)
