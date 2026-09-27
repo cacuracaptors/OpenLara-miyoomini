@@ -17,8 +17,6 @@ rebuilt for it: precise, perspective-correct and spread over both CPU cores. Thi
     vertices or cracks between polygons
   - a proper depth buffer, so objects no longer show through each other
   - rendering pipelined over both CPU cores
-  - water as in the original DOS game: what is underwater is tinted blue and its light shimmers, seen from
-    inside or outside the water, and the scene sways gently when the camera dives
   - effects that were invisible in OpenLara's software renderers: bubbles, bullet sparks, blood, splashes,
     smoke, flames and lava sparks
   - translucent menus and working health and air bars
