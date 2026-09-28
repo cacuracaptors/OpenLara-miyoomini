@@ -86,6 +86,7 @@ They don't work in Lara's Home, in cutscenes or on the title screen.
 
 - Lara gets teleported to pick up a nearby item on the ground instead of picking the one you were on. I'm currently working on a fix.
 - Picked up items show rotating at the bottom right of the screen are not rendered properly yet. Will be fixed soon.
+- Lara's voice is note playing in Lara's Home for now.
 - OpenLara aims to replicate the PS1 version of the game, so saving was supposed to work by collecting Savegame Crystals. I'm working on bringing savegame screen to work like the PC version, but you have to use Quicksave/Quickload for now.
 - The PC version of Tomb Raider has 9 music tracks (the menu theme, the ambient themes and the cutscenes); the
   in-level music of the PlayStation version was never part of it.
