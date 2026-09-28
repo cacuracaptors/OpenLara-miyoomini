@@ -84,6 +84,8 @@ They don't work in Lara's Home, in cutscenes or on the title screen.
 
 ## Known issues
 
+- Lara gets teleported to pick up a nearby item on the ground, instead of picking the one you were on. I'm currently working on a fix.
+- Picked up items show on the bottom right corner of the screen are not rendered properly yet.
 - The PC version of Tomb Raider has 9 music tracks (the menu theme, the ambient themes and the cutscenes); the
   in-level music of the PlayStation version was never part of it.
 - Large, busy areas may run below 60 FPS.
