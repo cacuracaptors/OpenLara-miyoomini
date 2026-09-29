@@ -866,8 +866,12 @@ struct Inventory {
     }
 
     void applySounds(bool pause) {
+        // TR1 PC: Lara's Home narration plays without a position (sounds
+        // 174-204, see Level::playTrack) and must pause along with the game
+        const bool tr1pc = game->getLevel()->version == TR::VER_TR1_PC;
         for (int i = 0; i < Sound::channelsCount; i++)
-            if (Sound::channels[i]->flags & Sound::PAN) {
+            if ((Sound::channels[i]->flags & Sound::PAN)
+                || (tr1pc && Sound::channels[i]->id >= 26 + 148 && Sound::channels[i]->id <= 56 + 148)) {
                 if (pause)
                     Sound::channels[i]->pause();
                 else
