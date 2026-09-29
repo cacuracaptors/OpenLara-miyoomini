@@ -19,12 +19,14 @@ rebuilt for it: precise, perspective-correct and spread over both CPU cores. Thi
   - rendering pipelined over both CPU cores
   - effects that were invisible in OpenLara's software renderers: bubbles, bullet sparks, blood, splashes,
     smoke, flames and lava sparks
+  - shadows under Lara and the enemies
   - translucent menus and working health and air bars
 - Easy installation: just copy the files from the GOG version. The game data is extracted from `GAME.GOG`
   automatically on the first start, with a progress screen
 - Music with the GOG file names, as they come (no renaming), including the cutscene audio
 - A full PS1-style control scheme adapted to the Miyoo Mini Plus buttons
-- Quick save and quick load shortcuts
+- Save anywhere from the passport (Save Game), as in the PC game, plus quick save and quick load shortcuts
+- Lara's Home narration, as in the PC game
 - 45 to 60 FPS
 
 ## Installation
@@ -66,7 +68,7 @@ folder instead of `GAME.GOG`.
 | Menu + R1 | Quick save |
 | Menu + L1 | Quick load |
 
-To exit the game, open the passport in the inventory and choose "Exit Game". The Menu key alone does nothing,
+To save, open the passport in the inventory and choose "Save Game?" (its "Current Position" is on the Load Game page). To exit, choose "Exit to Title" and then "Exit Game". The Menu key alone does nothing,
 so the OnionOS Menu+Power screenshot combo is safe to use at any time.
 
 ## Cheats
@@ -98,6 +100,7 @@ They don't work in Lara's Home, in cutscenes or on the title screen.
 
 ## Changelog
 
+- **v1.0.1** - Shadows under Lara and the enemies. Lara's Home narration now plays. Save the game from the passport, as in the PC game (the PlayStation save crystals are gone). Picking up items fixed: only the nearest one, from close by, with no more teleports (and keys stay in their keyholes). The picked-up item spinning in the corner is drawn correctly. Pushable blocks can only be grabbed from their own level (standing on top of one, Lara was pulled down to grab it).
 - **v1.0.0** - Initial release: Tomb Raider 1.
 
 ## Building from source

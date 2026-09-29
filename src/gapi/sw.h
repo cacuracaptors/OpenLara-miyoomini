@@ -229,8 +229,9 @@ namespace GAPI {
     // camera was underwater; the GL renderer does it in a shader. Here the
     // tint is baked into swShade, so it costs nothing per pixel.
     bool    swUnderwater = false;
+    bool    swShadowBatch = false; // drawing a shadow blob: darken what is below
+    bool    swModelInUI   = false; // a 3D model drawn without perspective (picked-up item): not 2D UI
     bool    swBatchWater = false;  // this batch: camera underwater, or geometry in a water room
-    bool    swSkyBatch   = false;  // drawing the TR2/TR3 sky: no fog, no far clipping
     float   swWaterTime  = 0.0f;   // seconds, set by the level each frame
     // 2D primitive whose UVs all point at one texel (the white sprite used
     // by frames, backgrounds and bars): fill it with its colour directly.
@@ -665,6 +666,7 @@ namespace GAPI {
         Texture     *tex;                                  // triangles, blit
         bool         affine, ortho, testZ, writeZ;
         bool         water;                                // triangles: use the underwater palette
+        bool         shadow;                               // triangles: darken instead of texturing
         short4       clip;
         int          triStart, triCount;
         int          sx0, sy0, sw, sh, ox0, oy0, ow, oh;   // blit
@@ -727,6 +729,7 @@ namespace GAPI {
         Texture       *tex;
         const ColorSW *pal;      // scene palette for this batch (dry or underwater)
         bool           affine, ortho, testZ, writeZ;
+        bool           shadow;
         short4         clip;
         int            band;     // 0: main core, 1: worker core
         long long      pixels;
@@ -825,7 +828,31 @@ namespace GAPI {
         }
     }
 
+    // Shadow blobs: halve the brightness of what is already on screen, depth
+    // tested and without writing depth; the software counterpart of the
+    // multiply blend the GPU renderers use.
+    static void drawShadowSpanSW(RasterCtxSW &ctx, int y, int x0, int x1, const PlaneSW &pQ) {
+        ctx.pixels += x1 - x0;
+        const int32 row   = y * Core::width;
+        ColorSW    *color = ctx.colorEnd - row;     // mirrored: pixel x at color[-x]
+        DepthSW    *depth = swDepth ? swDepth + row : NULL;
+        float       pq    = pQ.dx * (float(x0) + 0.5f) + pQ.dy * (float(y) + 0.5f) + pQ.c;
+        for (int x = x0; x < x1; x++, pq += pQ.dx) {
+            if (depth) {
+                int32 z = int32(pq * 536870912.0f);
+                if (z < 0) z = 0; else if (z > (65535 << 8)) z = 65535 << 8;
+                if ((z >> 8) < depth[x]) continue;
+            }
+            const ColorSW c = color[-x];
+            color[-x] = (sizeof(ColorSW) == 4) ? ColorSW((c >> 1) & 0x7F7F7F) : ColorSW((c >> 1) & 0x7BEF);
+        }
+    }
+
     void drawSpanSW(RasterCtxSW &ctx, int y, int x0, int x1, const PlaneSW &pU, const PlaneSW &pV, const PlaneSW &pQ, const PlaneSW &pL) {
+        if (ctx.shadow) {
+            drawShadowSpanSW(ctx, y, x0, x1, pQ);
+            return;
+        }
         const uint8 *texels = ctx.texels;
         if (!texels) return;
         ctx.pixels += x1 - x0;
@@ -1040,6 +1067,7 @@ namespace GAPI {
         swBatch->testZ    = swDepthTest;
         swBatch->writeZ   = swDepthWrite;
         swBatch->water    = swBatchWater;
+        swBatch->shadow   = swShadowBatch;
         swBatch->clip     = swClipRect;
         swBatch->triStart = f.triCount;
         swBatch->triCount = 0;
@@ -1061,7 +1089,9 @@ namespace GAPI {
         const VertexSW *t = swVertices.items + indices[0];
         const VertexSW *m = swVertices.items + indices[1];
         const VertexSW *b = swVertices.items + indices[2];
-        if (checkBackface(t, m, b)) return;
+        // the picked-up item: no culling (its winding is reversed with that
+        // projection); the depth test sorts its faces
+        if (!swModelInUI && checkBackface(t, m, b)) return;
         swAddTri(indices[0], indices[1], indices[2]);
     }
 
@@ -1070,7 +1100,9 @@ namespace GAPI {
         const VertexSW *t = swVertices.items + indices[0];
         const VertexSW *m = swVertices.items + indices[1];
         const VertexSW *b = swVertices.items + indices[2];
-        if (checkBackface(t, m, b)) return;
+        // the picked-up item: no culling (its winding is reversed with that
+        // projection); the depth test sorts its faces
+        if (!swModelInUI && checkBackface(t, m, b)) return;
         swAddTri(indices[0], indices[1], indices[2]);
         swAddTri(indices[0], indices[2], indices[3]);
     }
@@ -1127,6 +1159,7 @@ namespace GAPI {
                 ctx.writeZ = cmd.writeZ;
                 ctx.clip   = cmd.clip;
                 ctx.pal    = cmd.water ? f.palWater : f.palWorld;
+                ctx.shadow = cmd.shadow;
                 const TriSW *tri = f.tris + cmd.triStart;
                 for (int k = 0; k < cmd.triCount; k++, tri++) {
                     rasterTriangleSW(ctx, tri->a, tri->b, tri->c);
@@ -1338,11 +1371,10 @@ namespace GAPI {
         lighting += result.l;
 
         depth -= SW_FOG_START;
-        if (depth > 0.0f && !swSkyBatch) {
+        if (depth > 0.0f) {
             lighting *= clamp(1.0f - depth / (SW_MAX_DIST - SW_FOG_START), 0.0f, 1.0f);
         }
 
-        if (swSkyBatch) lighting = 255.0f;   // the sky is unlit: full brightness
         result.l = (255 - min(255, int32(lighting))) << 16;
     }
 
@@ -1379,6 +1411,10 @@ namespace GAPI {
         result.v = cv.v;
         result.l = cv.l;
         result.pq = invW;
+        if (swModelInUI)   // no perspective (w == 1): the depth comes from z, in a band
+                           // just below the depth buffer's maximum (1/w = 1/32)
+            result.pq = 1.0f / (32.5f - 0.5f * clamp(c.z, -1.0f, 1.0f));   // the UI camera's z runs
+                                                                             // the other way: nearer is larger
         result.pu = float(cv.u) * result.pq;
         result.pv = float(cv.v) * result.pq;
         result.fx = c.x;
@@ -1568,7 +1604,7 @@ namespace GAPI {
                            (uint32(vertex.light.z) << 16) | (uint32(vertex.light.w) << 24);
 
                 }
-                if (cv.c.w > SW_MAX_DIST && !swSkyBatch) tooFar = true;
+                if (cv.c.w > SW_MAX_DIST) tooFar = true;
                 // Orthographic (2D) geometry has w == 1 exactly: it is never
                 // behind the camera and must not be near-clipped.
                 const bool isOrtho = (cv.c.w == 1.0f);
@@ -1630,11 +1666,11 @@ namespace GAPI {
 
         const bool oldDepthTest  = swDepthTest;
         const bool oldDepthWrite = swDepthWrite;
-        if (swOrthoBatch) {
+        if (swOrthoBatch && !swModelInUI) {
             swDepthTest  = false;
             swDepthWrite = false;
         }
-        if (curTile == NULL && !swOrthoBatch) {
+        if (curTile == NULL && !swOrthoBatch && !swShadowBatch) {
             // untextured 3D batches stay unsupported, as upstream
             swDepthTest  = oldDepthTest;
             swDepthWrite = oldDepthWrite;
@@ -1647,7 +1683,9 @@ namespace GAPI {
             curTile = (Tile8*)swGradient;
         }
 
-        swBeginBatch(swOrthoBatch, swQuads.length * 2 + swTriangles.length);
+        // the picked-up item in the corner is a 3D model drawn without
+        // perspective: flagged by the UI, it stays a model (not 2D UI)
+        swBeginBatch(swOrthoBatch && !swModelInUI, swQuads.length * 2 + swTriangles.length);
 
         for (int i = 0; i < swQuads.length; i++) {
             drawQuad(&swIndices[swQuads[i]]);

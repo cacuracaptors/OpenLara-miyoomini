@@ -99,62 +99,6 @@ static void sndResample(Sound::Frame *out, int count) {
 #define SND_RING 8
 static Sound::Frame sndRing[SND_RING][SND_SAMPLES];
 
-// ---- DIAGNOSTIC (temporary): audio timing stats and a capture of the
-// exact data sent to MI_AO. The capture stays in RAM and is written to the
-// SD card once, when complete, so it does not stall playback.
-static long long sndNowUs() {
-    timeval t;
-    gettimeofday(&t, NULL);
-    return (long long)t.tv_sec * 1000000 + t.tv_usec;
-}
-
-static long long sndStatStart = 0, sndFillSum = 0, sndFillMax = 0;
-static int       sndStatBlocks = 0;
-static unsigned  sndBusyMin = 0xFFFFFFFFu, sndBusyMax = 0;
-
-static void sndStatReport() {
-    long long now = sndNowUs();
-    if (!sndStatStart) sndStatStart = now;
-    if (now - sndStatStart >= 5000000 && sndStatBlocks > 0) {
-        double secs = double(now - sndStatStart) / 1e6;
-        fprintf(stderr, "sound: %.1f blocks/s (expected %.1f) | fill avg %.2f ms max %.2f ms | queue busy min %u max %u\n",
-            sndStatBlocks / secs, double(SND_OUT_RATE) / double(SND_SAMPLES),
-            double(sndFillSum) / 1000.0 / sndStatBlocks, double(sndFillMax) / 1000.0,
-            sndBusyMin, sndBusyMax);
-        sndStatStart = now;
-        sndFillSum = sndFillMax = 0;
-        sndStatBlocks = 0;
-        sndBusyMin = 0xFFFFFFFFu;
-        sndBusyMax = 0;
-    }
-}
-
-#define SND_CAPTURE_SECONDS 40
-static Sound::Frame *sndCap     = NULL;
-static int           sndCapPos  = 0;
-static bool          sndCapDone = false;
-
-static void sndCapture(const Sound::Frame *buf) {
-    if (sndCapDone) return;
-    const int capFrames = SND_OUT_RATE * SND_CAPTURE_SECONDS;
-    if (!sndCap) sndCap = new Sound::Frame[capFrames];
-    int n = capFrames - sndCapPos;
-    if (n > SND_SAMPLES) n = SND_SAMPLES;
-    memcpy(sndCap + sndCapPos, buf, n * sizeof(Sound::Frame));
-    sndCapPos += n;
-    if (sndCapPos >= capFrames) {
-        FILE *f = fopen("snd_sent.raw", "wb");
-        if (f) {
-            fwrite(sndCap, sizeof(Sound::Frame), capFrames, f);
-            fclose(f);
-        }
-        delete[] sndCap;
-        sndCap = NULL;
-        sndCapDone = true;
-        fprintf(stderr, "sound: capture written (snd_sent.raw)\n");
-    }
-}
-
 static void* sndLoop(void *arg) {
     int slot = 0;
     int logs = 0;
@@ -163,17 +107,12 @@ static void* sndLoop(void *arg) {
         // might still be reading it.
         Sound::Frame *buf = sndRing[slot];
         slot = (slot + 1) % SND_RING;
-        long long tFill0 = sndNowUs();
         // Fill straight from the mixer, one whole block per call. Asking the
         // mixer for smaller pieces (512 frames, via the resampler) made it
         // drop a little decoded audio at some call boundaries: a click at
         // each one and music running fast. At 44.1 kHz no resampling is
         // needed anyway.
         Sound::fill(buf, SND_SAMPLES);
-
-        long long tFill = sndNowUs() - tFill0;
-        sndFillSum += tFill;
-        if (tFill > sndFillMax) sndFillMax = tFill;
 
         MI_AUDIO_Frame_t frame;
         memset(&frame, 0, sizeof(frame));
@@ -191,8 +130,6 @@ static void* sndLoop(void *arg) {
             MI_AO_ChnState_t st;
             memset(&st, 0, sizeof(st));
             if (MI_AO_QueryChnStat(sndDev, sndChn, &st) != MI_SUCCESS) break;
-            if (st.u32ChnBusyNum < sndBusyMin) sndBusyMin = st.u32ChnBusyNum;
-            if (st.u32ChnBusyNum > sndBusyMax) sndBusyMax = st.u32ChnBusyNum;
             MI_U32 total  = st.u32ChnFreeNum + st.u32ChnBusyNum;
             // Keep only ~3 blocks (~70 ms) queued. Filling the 64 KB queue to
             // the brim seemed to make the output overwrite audio not yet
@@ -212,8 +149,6 @@ static void* sndLoop(void *arg) {
             fprintf(stderr, "sound: SendFrame rejected a block\n");
             logs++;
         }
-        sndStatBlocks++;
-        sndStatReport();
     }
     return NULL;
 }
@@ -531,15 +466,6 @@ static void rasterWaitsForFlip() {
     flipWait();
 }
 
-// DIAGNOSTIC: time spent in the game logic (Game::update)
-static long long miyooUpdateUs = 0;
-static bool miyooTimedUpdate() {
-    long long t0 = GAPI::swPerfNow();
-    bool r = Game::update();
-    miyooUpdateUs += GAPI::swPerfNow() - t0;
-    return r;
-}
-
 #include "cdextract.h"   // first run: copy DATA/FMV out of GAME.GOG
 
 int main() {
@@ -641,36 +567,13 @@ int main() {
                 }
             }
         } else {
-            if (miyooTimedUpdate()) {
-                Uint32 perfT0 = SDL_GetTicks();
+            if (Game::update()) {
                 Game::render();
                 // Rasterize the recorded frame on both cores; each core then
                 // converts its own bands straight into the screen surface.
                 // Finish the previous frame (the main core's share) and send it
                 // to the screen; the worker core starts on this one right away.
                 GAPI::swFrameEnd();
-                Uint32 perfT1 = SDL_GetTicks();
-                Uint32 perfT2 = SDL_GetTicks();
-
-                {   // performance log, every 5 s
-                    static Uint32 perfStart = 0, perfRender = 0, perfPresent = 0;
-                    static int perfFrames = 0;
-                    if (!perfStart) perfStart = perfT0;
-                    perfRender  += perfT1 - perfT0;
-                    perfPresent += perfT2 - perfT1;
-                    perfFrames++;
-                    if (perfT2 - perfStart >= 5000) {
-                        fprintf(stderr, "perf: %.1f fps | render %.1f ms | present %.1f ms (per frame)\n",
-                            perfFrames * 1000.0f / float(perfT2 - perfStart),
-                            perfRender / float(perfFrames), perfPresent / float(perfFrames));
-                        fprintf(stderr, "perf:   raster %.1f ms (main core share + wait) | %.0fk pixels (per frame)\n",
-                            GAPI::swPerfRaster / 1000.0 / perfFrames, GAPI::swPerfPixels / 1000.0 / perfFrames);
-                        GAPI::swPerfRaster = GAPI::swPerfPixels = 0;
-                        perfStart = perfT2;
-                        perfRender = perfPresent = 0;
-                        perfFrames = 0;
-                    }
-                }
 
                 // The panel refreshes at 60 Hz, so anything faster only burns
                 // battery and heat. Wait out the rest of a ~16 ms frame.

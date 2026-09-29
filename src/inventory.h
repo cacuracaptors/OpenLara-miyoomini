@@ -1038,12 +1038,12 @@ struct Inventory {
                     case 1 : {
                         if (level->isTitle()) { // start new game
                             nextLevel = level->getStartId();
-                        } else { // restart level
-                            int slot = getSaveSlot(id, false);
-                            if (slot > -1)
-                                game->loadGame(slot);
-                            else
-                                nextLevel = id; 
+                        } else {
+                            // save the game, as the PC game's passport does (the save
+                            // crystals were a PlayStation feature): the "Current
+                            // Position" slot, the one the quick save uses
+                            game->saveGame(id, true, false);
+                            game->playSound(TR::SND_INV_PAGE);
                             toggle();
                         }
                         break;
@@ -1517,7 +1517,7 @@ struct Inventory {
             if (item->value == 1) str = STR_START_GAME;
             if (item->value == 2) str = STR_EXIT_GAME;
         } else {
-            if (item->value == 1) str = STR_RESTART_LEVEL;
+            if (item->value == 1) str = STR_SAVEGAME;   // the PC game's passport: Save Game
             if (item->value == 2) str = STR_EXIT_TO_TITLE;
         }
 

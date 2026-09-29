@@ -903,7 +903,13 @@ namespace UI {
 
             Core::setMaterial(1.0f, 0.0f, 0.0f, alpha);
 
+        #ifdef _GAPI_SW
+            GAPI::swModelInUI = true;
+        #endif
             game->renderModelFull(item.modelIndex - 1, false, joints);
+        #ifdef _GAPI_SW
+            GAPI::swModelInUI = false;
+        #endif
         }
 
         Core::setDepthTest(false);

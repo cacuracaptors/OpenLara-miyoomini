@@ -325,6 +325,11 @@ struct Lara : Character {
     float       hitTimer;
 
     bool        dozy;
+    bool        climbStatus;      // facing a climbable wall (TR2+ floor data)
+    vec3        pickupAlignFrom, pickupAlignTo;   // the pickup alignment glides
+    float       pickupAlignT;
+    int         climbFramePrev;   // last frame seen of the climb up/down animation
+    bool        climbGrab;        // caught a climbable wall mid-height (not a ledge)
     bool        canJump;
 
     int32       networkInput;
@@ -510,6 +515,10 @@ struct Lara : Character {
         networkInput = -1;
 
         dozy    = false;
+        climbStatus    = false;
+        climbFramePrev = -1;
+        pickupAlignT   = 1.0f;
+        climbGrab      = false;
         canJump = true;
 
         if (level->extra.laraSkin > -1)
@@ -914,6 +923,7 @@ struct Lara : Character {
                && state != STATE_FALL_BACK
                && state != STATE_HANG_LEFT
                && state != STATE_HANG_RIGHT
+               && !isClimbState(state)
                && state != STATE_SURF_TREAD
                && state != STATE_SURF_SWIM
                && state != STATE_DIVE
@@ -1550,7 +1560,11 @@ struct Lara : Character {
 
     virtual void cmdOffset(const vec3 &offset) {
         Character::cmdOffset(offset);
-        move();
+        // on a climbable wall the animations place Lara (the climbing probes
+        // check the wall); the normal collision would take her for someone
+        // hanging from a ledge who hit a wall and switch to the ledge grab
+        if (!isClimbState(state))
+            move();
     }
 
     virtual void cmdJump(const vec3 &vel) {
@@ -1796,6 +1810,18 @@ struct Lara : Character {
         return animation.setAnim(ANIM_TO_UNDERWATER);
     }
 
+    // Land pickups: the original game's reach box (256 units each way)
+    // feels far too long in play; the item must also be this close.
+    #define PICKUP_LAND_REACH 256.0f
+
+    const TR::Limits::Limit *pickupLimit(Controller *controller) {
+        switch (controller->getEntity().type) {
+            case TR::Entity::SCION_PICKUP_QUALOPEC : return &TR::Limits::SCION;
+            case TR::Entity::SCION_PICKUP_HOLDER   : return &TR::Limits::SCION_HOLDER;
+            default : return level->rooms[getRoomIndex()].flags.water ? &TR::Limits::PICKUP_UNDERWATER : &TR::Limits::PICKUP;
+        }
+    }
+
     bool doPickUp() {
         if (!animation.canSetState(STATE_PICK_UP))
             return false;
@@ -1803,6 +1829,15 @@ struct Lara : Character {
         int room = getRoomIndex();
 
         pickupListCount = 0;
+
+        // Upstream moved Lara onto every item in reach, one after the other:
+        // with two items close together she ended up on the second one and
+        // took both. Test them all without moving her, take the nearest one in
+        // reach, and only items lying at the very same spot come along.
+        Controller *inReach[COUNT(pickupList)];
+        int         inReachCount = 0;
+        Controller *nearest      = NULL;
+        float       nearestDist  = 1e30f;
 
         for (int i = 0; i < level->entitiesCount; i++) {
             TR::Entity &entity = level->entities[i];
@@ -1814,6 +1849,11 @@ struct Lara : Character {
             if (controller->getRoomIndex() != room || controller->flags.invisible)
                 continue;
 
+            // a key put in its keyhole is part of the lock now (it is the only
+            // tilted item: levels only turn objects around the vertical axis)
+            if (controller->angle.x != 0.0f)
+                continue;
+
             if (entity.type == TR::Entity::CRYSTAL) {
                 if (Input::lastState[camera->cameraIndex] == cAction) {
                     vec3 dir = controller->pos - pos;
@@ -1823,13 +1863,44 @@ struct Lara : Character {
                         return true;
                     }
                 }
-            } else {
-                if (!canPickup(controller))
-                    continue;
-
-                ASSERT(pickupListCount < COUNT(pickupList));
-                pickupList[pickupListCount++] = controller;
+                continue;
             }
+
+            float dist = (controller->pos - pos).length2();
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearest     = controller;
+            }
+
+            // dry run: in reach from where Lara stands? (the test moves her)
+            vec3  oPos   = pos;
+            vec3  oAngle = angle;
+            vec3  oVel   = velocity;
+            float oSpeed = speed;
+            bool  ok     = checkInteraction(controller, pickupLimit(controller), true);
+            pos      = oPos;
+            angle    = oAngle;
+            velocity = oVel;
+            speed    = oSpeed;
+
+            if (ok && inReachCount < COUNT(pickupList))
+                inReach[inReachCount++] = controller;
+        }
+
+        Controller *target = NULL;
+        for (int i = 0; i < inReachCount; i++)
+            if (!target || (inReach[i]->pos - pos).length2() < (target->pos - pos).length2())
+                target = inReach[i];
+
+        if (!target)
+            target = nearest;   // none in reach yet: underwater, Lara swims towards the nearest
+
+        if (target && canPickup(target)) {
+            pickupList[pickupListCount++] = target;
+            for (int i = 0; i < inReachCount; i++)
+                if (inReach[i] != target && pickupListCount < COUNT(pickupList)
+                    && (inReach[i]->pos - target->pos).length2() < SQR(64.0f))
+                    pickupList[pickupListCount++] = inReach[i];
         }
 
         if (pickupListCount > 0) {
@@ -1851,8 +1922,18 @@ struct Lara : Character {
             default : limit = level->rooms[getRoomIndex()].flags.water ? &TR::Limits::PICKUP_UNDERWATER : &TR::Limits::PICKUP;
         }
 
+        vec3 standPos = pos;
         if (!checkInteraction(controller, limit, true))
             return false;
+
+        // on land the alignment glides over the start of the pickup (upstream
+        // did it in a single frame, which looked like a teleport)
+        if (limit == &TR::Limits::PICKUP && (pos - standPos).length2() > 1.0f) {
+            pickupAlignFrom = standPos;
+            pickupAlignTo   = pos;
+            pickupAlignT    = 0.0f;
+            pos             = standPos;
+        }
 
         if (stand == Character::STAND_UNDERWATER)
             angle.x = -25 * DEG2RAD;
@@ -1904,6 +1985,19 @@ struct Lara : Character {
     bool checkInteraction(Controller *controller, const TR::Limits::Limit *limit, bool action) {
         if ((state != STATE_STOP && state != STATE_TREAD && state != STATE_PUSH_PULL_READY) || !action || !emptyHands())
             return false;
+
+        // the largest reach box is a block wide: nothing further can be in
+        // reach, whatever the object's matrix says (a key left in its
+        // keyhole kept a stale one and was "in reach" from anywhere)
+        if ((controller->pos - pos).length2() > SQR(2048.0f))
+            return false;
+
+        // land pickups: also within PICKUP_LAND_REACH of the item, horizontally
+        if (limit == &TR::Limits::PICKUP) {
+            vec3 d = controller->pos - pos;
+            if (d.x * d.x + d.z * d.z > SQR(PICKUP_LAND_REACH))
+                return false;
+        }
 
         vec3 tmpAngle = controller->angle;
         vec3 ctrlAngle = controller->angle;
@@ -2281,6 +2375,15 @@ struct Lara : Character {
     virtual Stand getStand() {
         if (dozy) return STAND_UNDERWATER;
 
+        updateClimbStatus();
+        if (isClimbState(state)) {
+            if ((input & ACTION) && health > 0.0f)
+                return STAND_HANG;
+            animation.setAnim(ANIM_FALL_FORTH);   // let go of the wall
+            velocity = vec3(0.0f);
+            return STAND_AIR;
+        }
+
         if (stand == STAND_ONWATER && state == STATE_STOP)
             return STAND_GROUND;
 
@@ -2458,6 +2561,14 @@ struct Lara : Character {
                 } else
                     return animation.setAnim(ANIM_HANG, -15);
             }
+
+            // no ledge: a climbable wall to hold on to?
+            if (climbStatus && velocity.y >= 0.0f && testHangOnClimbWall(bounds)) {
+                velocity  = vec3(0.0f);
+                stand     = STAND_HANG;
+                climbGrab = true;
+                return animation.setAnim(ANIM_HANG, -15);
+            }
         }
 
         if ((level->version & TR::VER_VERSION) > TR::VER_TR1) {
@@ -2509,6 +2620,12 @@ struct Lara : Character {
                 continue;
 
             Block *block = (Block*)e.controller;
+
+            // as in the original, only from the block's own level: standing on
+            // top of it, Lara was pulled down to grab it from the side
+            if (fabsf(pos.y - block->pos.y) > 128.0f)
+                continue;
+
             float oldAngle = block->angle.y;
             block->angle.y = angleQuadrant(angle.y, 0.25f) * (PI * 0.5f);
 
@@ -2533,6 +2650,370 @@ struct Lara : Character {
 
         ASSERT(false);
         return STATE_STOP;
+    }
+
+    // ---- climbable walls (TR2+) ---------------------------------------------
+    // States 56..61 and animations 161/164/168 are the original game's. The
+    // probes below are the original LaraTestClimb* functions; a solid sector
+    // reads as floor == ceiling == -127 * 256, the original NO_HEIGHT.
+
+    enum { CLIMB_ANIM_UP = 161, CLIMB_ANIM_STANCE = 164, CLIMB_ANIM_DOWN = 168, CLIMB_NO_HEIGHT = -127 * 256 };
+
+    static bool isClimbState(int s) {
+        return s >= STATE_CLIMB_START && s <= STATE_CLIMB_DOWN;
+    }
+
+    void updateClimbStatus() {
+        climbStatus = false;
+        if ((level->version & TR::VER_VERSION) <= TR::VER_TR1)
+            return;
+        TR::Level::FloorInfo info;
+        getFloorInfo(getRoomIndex(), pos, info);
+        climbStatus = ((info.climb >> angleQuadrant(angle.y, 0.25f)) & 1) != 0;
+    }
+
+    void climbProbe(int x, int y, int z, int &floor, int &ceiling) {
+        TR::Level::FloorInfo info;
+        getFloorInfo(getRoomIndex(), vec3(float(x), float(y), float(z)), info);
+        floor   = int(info.floor);
+        ceiling = int(info.ceiling);
+    }
+
+    // 1: climbable, 0: not, -1: only hanging by the hands is possible here
+    int testClimb(int x, int y, int z, int xfront, int zfront, int itemHeight, int &shift) {
+        shift = 0;
+        if (!climbStatus)
+            return 0;
+
+        bool hang = true;
+        int f, c;
+        climbProbe(x, y - 128, z, f, c);
+        if (f == CLIMB_NO_HEIGHT)
+            return 0;
+
+        int h = f - (128 + y + itemHeight);
+        if (h < -70) return 0;
+        if (h < 0) shift = h;
+
+        c -= y;
+        if (c > 70) return 0;
+        if (c > 0) {
+            if (shift) return 0;
+            shift = c;
+        }
+
+        if (itemHeight + h < 900)
+            hang = false;
+
+        climbProbe(x + xfront, y, z + zfront, f, c);
+        h = (f != CLIMB_NO_HEIGHT) ? f - y : f;
+
+        if (h <= 70) {
+            if (h > 0) {
+                if (shift < 0) return 0;
+                if (h > shift) shift = h;
+            }
+            int f2, c2;
+            climbProbe(x + xfront, y + itemHeight, z + zfront, f2, c2);
+            if (c2 == CLIMB_NO_HEIGHT) return 1;
+            c2 -= y;
+            if (c2 <= h || c2 >= 512) return 1;
+            if (c2 > 442 && shift <= 0) {
+                shift = c2 - 512;
+                return 1;
+            }
+            return hang ? -1 : 0;
+        }
+
+        c -= y;
+        if (c >= 512) return 1;
+        if (c > 442) {
+            if (shift <= 0) {
+                shift = c - 512;
+                return 1;
+            }
+            return hang ? -1 : 0;
+        }
+        if (c > 0) return hang ? -1 : 0;
+        if (c <= -70 || !hang || shift > 0) return 0;
+        if (shift > c) shift = c;
+        return -1;
+    }
+
+    void climbPoint(float front, float right, int &x, int &z, int &xf, int &zf) {
+        xf = zf = 0;
+        switch (angleQuadrant(angle.y, 0.25f)) {
+            case 0  : x = int(pos.x + right); z = int(pos.z + front); zf =  4; break;
+            case 1  : x = int(pos.x + front); z = int(pos.z - right); xf =  4; break;
+            case 2  : x = int(pos.x - right); z = int(pos.z - front); zf = -4; break;
+            default : x = int(pos.x - front); z = int(pos.z + right); xf = -4; break;
+        }
+    }
+
+    int testClimbPos(float front, float right, int origin, int height, int &shift) {
+        int x, z, xf, zf;
+        climbPoint(front, right, x, z, xf, zf);
+        return testClimb(x, int(pos.y) + origin, z, xf, zf, height, shift);
+    }
+
+    // above the hands: 1 keep climbing, -1 a ledge to climb onto (ledge = its height), 0 blocked
+    int testClimbUpPos(float front, float right, int &shift, int &ledge) {
+        int x, z, xf, zf;
+        climbPoint(front, right, x, z, xf, zf);
+        int y = int(pos.y) - 768;
+
+        shift = 0;
+        int f, c;
+        climbProbe(x, y, z, f, c);
+        c = 256 - y + c;
+        if (c > 70) return 0;
+        if (c > 0) shift = c;
+
+        climbProbe(x + xf, y, z + zf, f, c);
+        if (f == CLIMB_NO_HEIGHT) {
+            ledge = CLIMB_NO_HEIGHT;
+            return 1;
+        }
+        int h = f - y;
+        ledge = h;
+
+        if (h <= 128) {
+            if (h > 0 && h > shift) shift = h;
+            int f2, c2;
+            climbProbe(x + xf, y + 512, z + zf, f2, c2);
+            c2 -= y;
+            return (c2 <= h || c2 >= 512) ? 1 : 0;
+        }
+
+        c -= y;
+        if (c >= 512) return 1;
+        if (h - c > 762) {
+            shift = h;
+            return -1;
+        }
+        return 0;
+    }
+
+    // the vertical shift both hands agree on (the original's merging rule)
+    static int climbMergeShift(int r, int l, bool useRightAlone) {
+        if (r && l) {
+            if ((l >= 0) == (r >= 0)) {
+                if (r < 0 && r < l) l = r;
+                else if (r > 0 && r > l) l = r;
+            }
+        } else if (r && useRightAlone)
+            l = r;
+        return l;
+    }
+
+    bool testClimbStance(int &shift) {
+        int sr, sl;
+        shift = 0;
+        if (testClimbPos(LARA_RADIUS,   LARA_RADIUS + 120,  -700, 512, sr) != 1) return false;
+        if (testClimbPos(LARA_RADIUS, -(LARA_RADIUS + 120), -700, 512, sl) != 1) return false;
+        if (sr && sl && ((sl < 0) != (sr < 0))) return false;
+        if (sr) {
+            if (sl && ((sr < 0 && sl < sr) || (sr > 0 && sl > sr))) sr = sl;
+            shift = sr;
+        } else
+            shift = sl;
+        return true;
+    }
+
+    // jumping up against a climbable wall with no ledge to grab
+    bool testHangOnClimbWall(const Box &bounds) {
+        vec3  opos   = pos;
+        float oangle = angle.y;
+
+        alignToWall(-LARA_RADIUS);
+        updateClimbStatus();
+
+        int top    = int(bounds.min.y - pos.y);
+        int height = int(bounds.max.y - bounds.min.y);
+        int shift;
+
+        if (climbStatus
+            && testClimbPos(LARA_RADIUS,  LARA_RADIUS, top, height, shift)
+            && testClimbPos(LARA_RADIUS, -LARA_RADIUS, top, height, shift)) {
+            int res = testClimbPos(LARA_RADIUS, 0, top, height, shift);
+            if (res) {
+                if (res != 1) pos.y += shift;
+                return true;
+            }
+        }
+
+        pos     = opos;
+        angle.y = oangle;
+        updateClimbStatus();
+        return false;
+    }
+
+    // standing, pushing against a climbable wall with Action: step onto it
+    bool checkLadder() {
+        if (!climbStatus || (input & (FORTH | ACTION)) != (FORTH | ACTION) || (input & (LEFT | RIGHT))
+            || (animation.index != ANIM_STAND && animation.index != ANIM_STAND_NORMAL)
+            || !emptyHands() || collision.side != Collision::FRONT)
+            return false;
+
+        float wall = pos.y - collision.info[Collision::FRONT].floor;
+        TR::Level::FloorInfo info;
+        getFloorInfo(getRoomIndex(), pos, info);
+        if (!(wall > 1024.0f || collision.info[Collision::FRONT].ceiling - pos.y >= 506.0f) || info.ceiling - pos.y > -518.0f)
+            return false;
+
+        vec3  opos   = pos;
+        float oangle = angle.y;
+        alignToWall(-LARA_RADIUS);
+        updateClimbStatus();
+
+        int shift;
+        if (climbStatus && testClimbStance(shift) && animation.canSetState(STATE_CLIMB_START)) {
+            pos.y += shift;
+            velocity = vec3(0.0f);
+            return true;
+        }
+        pos     = opos;
+        angle.y = oangle;
+        updateClimbStatus();
+        return false;
+    }
+
+    // the climb up/down animations can go back to the stance at frames 0, 29 and 58;
+    // frames can be skipped at a variable frame rate, so crossings are detected
+    bool climbCheckpoint(int animIndex, int step, int &yshift) {
+        if (animation.index != animIndex) {
+            climbFramePrev = -1;
+            return false;
+        }
+        int f    = animation.frameIndex;
+        int prev = climbFramePrev;
+        int best = -1;
+        if (prev > f) {             // looped: the end of the cycle was crossed
+            if (prev < 58) best = 58;
+            prev = -1;
+        }
+        climbFramePrev = f;
+        if (best < 0) {
+            if (prev < 0  && f >= 0)  best = 0;
+            if (prev < 29 && f >= 29) best = 29;
+            if (prev < 58 && f >= 58) best = 58;
+        }
+        if (best < 0)
+            return false;
+        yshift = (best == 0) ? 0 : ((best == 29) ? step : step * 2);
+        return true;
+    }
+
+    int getStateClimb() {
+        const float side = LARA_RADIUS + 120;
+        int sr, sl, lr, ll, rr, rl, yshift;
+
+        switch (state) {
+            case STATE_CLIMB_START : {
+                climbFramePrev = -1;
+                if (animation.index != CLIMB_ANIM_STANCE)
+                    return state;
+
+                if (input & LEFT)  return STATE_CLIMB_LEFT;
+                if (input & RIGHT) return STATE_CLIMB_RIGHT;
+                if (input & JUMP)  return STATE_BACK_JUMP;
+
+                if (input & FORTH) {
+                    rr = testClimbUpPos(LARA_RADIUS,  side, sr, lr);
+                    rl = testClimbUpPos(LARA_RADIUS, -side, sl, ll);
+                    if (rr && rl) {
+                        if (rr >= 0 && rl >= 0) {
+                            if (animation.canSetState(STATE_CLIMB_UP)) {
+                                pos.y += climbMergeShift(sr, sl, true);
+                                return STATE_CLIMB_UP;
+                            }
+                        } else if (abs(ll - lr) <= 120 && animation.canSetState(STATE_HANG_UP)) {
+                            pos.y += (ll + lr) / 2 - 256;     // onto the ledge at the top
+                            return STATE_HANG_UP;
+                        }
+                    }
+                } else if (input & BACK) {
+                    pos.y += 256;
+                    rr = testClimbPos(LARA_RADIUS,  side, -512, 512, sr);
+                    rl = testClimbPos(LARA_RADIUS, -side, -512, 512, sl);
+                    pos.y -= 256;
+                    if (rr && rl) {
+                        if (rr == 1 && rl == 1) {
+                            if (animation.canSetState(STATE_CLIMB_DOWN)) {
+                                pos.y += climbMergeShift(sr, sl, false);
+                                return STATE_CLIMB_DOWN;
+                            }
+                        } else
+                            return STATE_HANG;                // the bottom of the wall: hang
+                    }
+                }
+                return state;
+            }
+
+            case STATE_CLIMB_LEFT  :
+                climbFramePrev = -1;
+                return (input & LEFT)  ? state : STATE_CLIMB_START;
+
+            case STATE_CLIMB_RIGHT :
+                climbFramePrev = -1;
+                return (input & RIGHT) ? state : STATE_CLIMB_START;
+
+            case STATE_CLIMB_UP : {
+                if (!climbCheckpoint(CLIMB_ANIM_UP, -256, yshift))
+                    return state;
+                pos.y += yshift - 256;
+                rr = testClimbUpPos(LARA_RADIUS,  side, sr, lr);
+                rl = testClimbUpPos(LARA_RADIUS, -side, sl, ll);
+                pos.y += 256;
+                if (rr && rl && (input & FORTH) && rr >= 0 && rl >= 0) {
+                    pos.y -= yshift;                          // keep going: the animation moves her
+                    return STATE_CLIMB_UP;
+                }
+                return STATE_CLIMB_START;                     // stop here (a ledge is taken from the stance)
+            }
+
+            case STATE_CLIMB_DOWN : {
+                if (!climbCheckpoint(CLIMB_ANIM_DOWN, 256, yshift))
+                    return state;
+                pos.y += yshift + 256;
+                rr = testClimbPos(LARA_RADIUS,  side, -512, 512, sr);
+                rl = testClimbPos(LARA_RADIUS, -side, -512, 512, sl);
+                pos.y -= 256;
+                if (!rr || !rl || !(input & BACK))
+                    return STATE_CLIMB_START;
+                if (sr && sl && ((sl < 0) != (sr < 0)))
+                    return STATE_CLIMB_START;
+                if (rr == -1 || rl == -1) {
+                    animation.setAnim(CLIMB_ANIM_STANCE);
+                    return STATE_HANG;
+                }
+                pos.y -= yshift;
+                return STATE_CLIMB_DOWN;
+            }
+        }
+        return state;
+    }
+
+    // climbing moves only by the animations; sideways moves are checked here
+    void updateClimbPosition() {
+        if (state != STATE_CLIMB_LEFT && state != STATE_CLIMB_RIGHT)
+            return;
+
+        vec3 opos = pos;
+        pos += velocity * Core::deltaTime * 30.0f;
+
+        float right = (state == STATE_CLIMB_LEFT) ? -(LARA_RADIUS + 120) : (LARA_RADIUS + 120);
+        int shift;
+        int res = testClimbPos(LARA_RADIUS, right, -512, 512, shift);
+        if (res == 1) {
+            pos.y += shift;
+        } else if (res == 0) {
+            pos = opos;
+            animation.setAnim(CLIMB_ANIM_STANCE);
+        } else {
+            pos = opos;
+            animation.setState(STATE_HANG);
+        }
     }
 
     bool checkClimb() {
@@ -2572,6 +3053,9 @@ struct Lara : Character {
 
         if ((input == ACTION) && (state == STATE_STOP) && emptyHands() && doPickUp())
             return state;
+
+        if (checkLadder())
+            return STATE_CLIMB_START;
 
         if (checkClimb())
             return state;
@@ -2719,6 +3203,22 @@ struct Lara : Character {
     }
 
     virtual int getStateHang() {
+        if (isClimbState(state))
+            return getStateClimb();
+
+        // hanging on a climbable wall: take the climbing stance, at once when
+        // caught mid-wall, or with Down from its top ledge (Up climbs onto it)
+        if (state != STATE_HANG)
+            climbGrab = false;
+        if (state == STATE_HANG && climbStatus && (climbGrab || (input & BACK)) && (animation.index != ANIM_HANG || animation.frameIndex >= 21)) {
+            int shift;
+            if (testClimbStance(shift) && animation.canSetState(STATE_CLIMB_START)) {
+                pos.y += shift;
+                climbGrab = false;
+                return STATE_CLIMB_START;
+            }
+        }
+
         if (input & LEFT)  return STATE_HANG_LEFT;
         if (input & RIGHT) return STATE_HANG_RIGHT;
         if (input & FORTH) {
@@ -2843,6 +3343,9 @@ struct Lara : Character {
         if ((input & FORTH) && (input & BACK))
             input &= ~(FORTH | BACK);
 
+        if (checkLadder())          // standing in shallow water at a ladder
+            return STATE_CLIMB_START;
+
         if (checkClimb())
             return state;
 
@@ -2929,7 +3432,7 @@ struct Lara : Character {
         if (state == STATE_DIVE || (state == STATE_RUN && (input & JUMP)) ) return state;
         switch (stand) {
             case STAND_GROUND     : return STATE_STOP;
-            case STAND_HANG       : return STATE_HANG;
+            case STAND_HANG       : return isClimbState(state) ? STATE_CLIMB_START : STATE_HANG;
             case STAND_ONWATER    : return STATE_SURF_TREAD;
             case STAND_UNDERWATER : return STATE_TREAD;
             case STAND_WADE       : return STATE_STOP;
@@ -2975,6 +3478,13 @@ struct Lara : Character {
             case STATE_HANG_LEFT  :
             case STATE_HANG_RIGHT :
                 camera->setAngle(-60, 0);
+                break;
+            case STATE_CLIMB_START :
+            case STATE_CLIMB_LEFT  :
+            case STATE_CLIMB_RIGHT :
+            case STATE_CLIMB_UP    :
+            case STATE_CLIMB_DOWN  :
+                camera->setAngle(-20, 0);
                 break;
             case STATE_PUSH_BLOCK :
             case STATE_PULL_BLOCK :
@@ -3431,12 +3941,14 @@ struct Lara : Character {
             case STATE_STEP_LEFT  :
             case STATE_SURF_LEFT  :
             case STATE_HANG_LEFT  :
+            case STATE_CLIMB_LEFT :
                 angleExt -= PI * 0.5f;
                 break;
             case STATE_RIGHT_JUMP :
             case STATE_STEP_RIGHT :
             case STATE_SURF_RIGHT :
             case STATE_HANG_RIGHT :
+            case STATE_CLIMB_RIGHT :
                 angleExt +=  PI * 0.5f;
                 break;
         }
@@ -3509,6 +4021,21 @@ struct Lara : Character {
     virtual void updatePosition() { // TODO: sphere / bbox collision
         if (level->isCutsceneLevel())
             return;
+
+        if (pickupAlignT < 1.0f) {
+            if (state != STATE_PICK_UP && pickupAlignT > 0.0f) {
+                pickupAlignT = 1.0f;          // interrupted
+            } else {
+                pickupAlignT = min(1.0f, pickupAlignT + Core::deltaTime / 0.2f);
+                float s = pickupAlignT * pickupAlignT * (3.0f - 2.0f * pickupAlignT);
+                pos = pickupAlignFrom + (pickupAlignTo - pickupAlignFrom) * s;
+            }
+        }
+
+        if (isClimbState(state)) {
+            updateClimbPosition();
+            return;
+        }
 
         // tilt control
         vec2 vTilt(LARA_TILT_SPEED * Core::deltaTime, LARA_TILT_MAX);

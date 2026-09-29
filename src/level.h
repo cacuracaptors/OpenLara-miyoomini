@@ -894,6 +894,29 @@ struct Level : IGame {
     }
 
     virtual void playTrack(uint8 track, bool background = false) {
+        // TR1 PC: Lara's Home narration is not on the CD but in GYM.PHD, as
+        // sound effects played for "track + 148" (CD tracks on the PlayStation)
+        if (!background && level.version == TR::VER_TR1_PC && track >= 26 && track <= 56) {
+            const int line = track + 148;
+            bool playing = false;
+            {
+                OS_LOCK(Sound::lock);
+                for (int i = 0; i < Sound::channelsCount; i++)
+                    if (Sound::channels[i]->id == line && Sound::channels[i]->isPlaying)
+                        playing = true;
+            }
+            // a trigger without the "once" flag fires every frame while Lara
+            // stands on it: leave the line playing instead of restarting it
+            if (playing)
+                return;
+            for (int id = 26 + 148; id <= 56 + 148; id++)
+                Sound::stop(id);                  // one line at a time, as the CD tracks
+            if (playSound(line)) {
+                UI::showSubs(TR::getSubs(level.version, track));
+                return;
+            }
+        }
+
         if (background) {
             TR::getGameTrack(level.version, track, playAsyncBG, new TrackRequest(this, Sound::MUSIC));
             return;
@@ -1199,7 +1222,14 @@ struct Level : IGame {
             case TR::Entity::INV_KEY_ITEM_3        :
             case TR::Entity::INV_KEY_ITEM_4        : return new KeyItemInv(this, index);
             case TR::Entity::TRAP_FLOOR            : return new TrapFloor(this, index);
-            case TR::Entity::CRYSTAL               : return new Crystal(this, index);
+            case TR::Entity::CRYSTAL               : {
+                Crystal *crystal = new Crystal(this, index);
+                // save crystals are a PlayStation feature: the PC game has
+                // none and saves anywhere (the quick save here)
+                if (level.version & TR::VER_PC)
+                    crystal->deactivate(true);
+                return crystal;
+            }
             case TR::Entity::TRAP_SWING_BLADE      : return new TrapSwingBlade(this, index);
             case TR::Entity::TRAP_SPIKES           : return new TrapSpikes(this, index);
             case TR::Entity::TRAP_BOULDER          : 
@@ -1852,6 +1882,8 @@ struct Level : IGame {
             TR::Entity &e = level.entities[i];
             if (e.type == TR::Entity::CRYSTAL) {
                 Crystal *c = (Crystal*)e.controller;
+                if (c->flags.invisible) // hidden (PC): nothing to reflect
+                    continue;
                 if (c->environment) { // already initialized and baked
                     continue;
                 }
@@ -1872,37 +1904,6 @@ struct Level : IGame {
     }
 
     void renderSky() {
-    #ifdef _GAPI_SW
-        // TR2/TR3 skies are a textured model around the camera (TR1 has none:
-        // its black backdrop is original). The software renderer draws it
-        // first, without depth, as a backdrop the level then covers (see
-        // renderOpaque), and without fog or far clipping (swSkyBatch).
-        if (!(level.version & TR::VER_TR1) && level.extra.sky != -1) {
-            Core::Pass pass = Core::pass;
-            mat4 mView = Core::mView;
-            mat4 mProj = Core::mProj;
-
-            Core::mView.setPos(vec3(0));
-            Core::setViewProj(Core::mView, Core::mProj);
-            setShader(Core::passSky, Shader::DEFAULT, false, false);
-            GAPI::setPalette(GAPI::swPaletteColor);   // not whichever room palette came last
-            Core::setDepthTest(false);
-            Core::setDepthWrite(false);
-
-            GAPI::swSkyBatch = true;
-            Basis b;
-            b.identity();   // Basis() leaves w unset, and renderModel skips parts with w == 0
-            Core::setBasis(&b, 1);
-            mesh->renderModel(level.extra.sky);
-            GAPI::swSkyBatch = false;
-
-            Core::setDepthTest(true);
-            Core::setDepthWrite(true);
-            Core::setViewProj(mView, mProj);
-            Core::pass = pass;
-        }
-        return;
-    #endif
         #if !defined(_GAPI_GL) && !defined(_GAPI_D3D11)
             return;
         #endif
@@ -2511,6 +2512,17 @@ struct Level : IGame {
             }
             Core::setBlendMode(bmNone);
         #endif
+        #ifdef _GAPI_SW
+            // the software renderer darkens the pixels under the shadow blobs
+            GAPI::swShadowBatch = true;
+            for (int i = 0; i < level.entitiesCount; i++) {
+                TR::Entity &entity = level.entities[i];
+                Controller *controller = (Controller*)entity.controller;
+                if (controller && controller->flags.rendered && controller->getEntity().castShadow())
+                    controller->renderShadow(mesh);
+            }
+            GAPI::swShadowBatch = false;
+        #endif
         }
 
         if (transp == 2) {
@@ -2633,20 +2645,11 @@ struct Level : IGame {
     }
 
     void renderOpaque(RoomDesc *roomsList, int roomsCount) {
-    #ifdef _GAPI_SW
-        // software renderer: the sky goes first, as a backdrop without depth
-        if (Core::pass != Core::passShadow && skyIsVisible) {
-            renderSky();
-        }
-        renderRooms(roomsList, roomsCount, 0);
-        renderEntities(0);
-    #else
         renderRooms(roomsList, roomsCount, 0);
         renderEntities(0);
         if (Core::pass != Core::passShadow && skyIsVisible) {
             renderSky();
         }
-    #endif
     }
 
     void renderTransparent(RoomDesc *roomsList, int roomsCount) {
