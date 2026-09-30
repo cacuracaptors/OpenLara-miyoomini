@@ -140,21 +140,31 @@ struct Enemy : Character {
         return false;
     }
 
+    // Keeps the enemy its radius away from an edge it can't cross. As in the
+    // original game (CreatureAnimation) the shift is measured from the edge
+    // of the sector it stands in; upstream clamped it to the whole box's
+    // limit, which on a large box is sectors away and off any box, so the
+    // move was undone every frame and the enemy ran in place.
     void clipByBox(vec3 &pos) {
-        int px = int(pos.x);
-        int pz = int(pos.z);
-        int nx = px;
-        int nz = pz;
+        const int x  = int(pos.x);
+        const int z  = int(pos.z);
+        const int sx = x & 1023;
+        const int sz = z & 1023;
+        const int r  = min(radius, 511);
+        int shiftX = 0, shiftZ = 0;
 
-        TR::Box &a = level->boxes[box];
-            
-        if (!checkPoint(px - radius, pz)) nx = a.minX + radius;
-        if (!checkPoint(px + radius, pz)) nx = a.maxX - radius;
-        if (!checkPoint(px, pz - radius)) nz = a.minZ + radius;
-        if (!checkPoint(px, pz + radius)) nz = a.maxZ - radius;
+        if (sz < r && !checkPoint(x, z - r))
+            shiftZ = r - sz;
+        else if (sz > 1024 - r && !checkPoint(x, z + r))
+            shiftZ = (1024 - r) - sz;
 
-        if (px != nx) pos.x = float(nx);
-        if (pz != nz) pos.z = float(nz);
+        if (sx < r && !checkPoint(x - r, z))
+            shiftX = r - sx;
+        else if (sx > 1024 - r && !checkPoint(x + r, z))
+            shiftX = (1024 - r) - sx;
+
+        pos.x += float(shiftX);
+        pos.z += float(shiftZ);
     }
 
     void collideEnemies() {

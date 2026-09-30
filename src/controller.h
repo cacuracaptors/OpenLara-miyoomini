@@ -259,6 +259,11 @@ struct Controller {
         TR::Room::Sector *sBelow = &s;
         while (sBelow->roomBelow != TR::NO_ROOM && !level->isSolidFloorTriangle(sBelow, x, z)) sBelow = &level->getSector(sBelow->roomBelow, x, z, dx, dz);
         info.floor = float(256 * sBelow->floor);
+        // the box goes with the floor sector (as in the original game): the
+        // sector of an upper room over a floor portal has no box, which made
+        // that spot an invisible wall for the enemies (a bear in City of
+        // Vilcabamba ran in place there)
+        info.boxIndex = sBelow->boxIndex;
 
         parseFloorData(info, sBelow->floorIndex, dx, dz);
 

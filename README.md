@@ -96,6 +96,7 @@ They don't work in Lara's Home, in cutscenes or on the title screen.
 
 ## Changelog
 
+- **v1.0.2** - Fixed enemies getting stuck running in place near some edges (the second bear in City of Vilcabamba): they are now kept away from walls the way the original game does it.
 - **v1.0.1** - Shadows under Lara and the enemies. Lara's Home narration now plays. Save the game from the passport, as in the PC game (the PlayStation save crystals are gone). Picking up items fixed: only the nearest one, from close by, with no more teleports (and keys stay in their keyholes). The picked-up item spinning in the corner is drawn correctly. Pushable blocks can only be grabbed from their own level (standing on top of one, Lara was pulled down to grab it).
 - **v1.0.0** - Initial release: Tomb Raider 1.
 
