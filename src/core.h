@@ -105,6 +105,9 @@
     #define _OS_BITTBOY 1
     #define _OS_LINUX   1
     #define _GAPI_SW    1
+    #ifdef __MIYOO__
+        #define INV_SINGLE_PLAYER // one player, one gamepad: no player or gamepad choice in Set Controls
+    #endif
 #elif __GCW0__
     #define _OS_GCW0   1
     #define _GAPI_GL   1

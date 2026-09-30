@@ -76,6 +76,11 @@ struct OptionItem {
             alpha = uint8(t * 255.0f);
         }
 
+    #ifdef __MIYOO__
+        if (vStr == STR_PRESS_ANY_KEY)
+            UI::textOut(vec2(x, y), "Press a button", UI::aCenter, w, alpha, UI::SHADE_GRAY);
+        else
+    #endif
         UI::textOut(vec2(x, y), vStr, UI::aCenter, w, alpha, UI::SHADE_GRAY); // color as StringID
 
         if (type == TYPE_PARAM && active) {
@@ -184,7 +189,9 @@ static const OptionItem optControls[] = {
 #endif
     OptionItem( OptionItem::TYPE_PARAM,  STR_OPT_CONTROLS_RETARGET   , SETTINGS( controls[0].retarget           ), STR_OFF,       0, 1 ),
     OptionItem( OptionItem::TYPE_PARAM,  STR_OPT_CONTROLS_MULTIAIM   , SETTINGS( controls[0].multiaim           ), STR_OFF,       0, 1 ),
-#ifdef INV_GAMEPAD_ONLY
+#if defined(__MIYOO__)
+    // Miyoo: gamepad only, no keyboard/gamepad choice (ctrlIndex is set to 1 when the page opens)
+#elif defined(INV_GAMEPAD_ONLY)
     OptionItem( OptionItem::TYPE_PARAM,  STR_EMPTY                   , SETTINGS( ctrlIndex                      ), STR_OPT_CONTROLS_KEYBOARD, 0, 0xFF ),
 #else
     OptionItem( OptionItem::TYPE_PARAM,  STR_EMPTY                   , SETTINGS( ctrlIndex                      ), STR_OPT_CONTROLS_KEYBOARD, 0, 1 ),
@@ -198,13 +205,15 @@ static const OptionItem optControls[] = {
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cAction    , SETTINGS( controls[0].keys[ cAction    ] ), STR_KEY_FIRST ),
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cWeapon    , SETTINGS( controls[0].keys[ cWeapon    ] ), STR_KEY_FIRST ),
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cLook      , SETTINGS( controls[0].keys[ cLook      ] ), STR_KEY_FIRST ),
-#if !(defined(INV_GAMEPAD_ONLY) && defined(INV_GAMEPAD_NO_TRIGGER))
+#if !(defined(INV_GAMEPAD_ONLY) && defined(INV_GAMEPAD_NO_TRIGGER)) && !defined(__MIYOO__)
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cDuck      , SETTINGS( controls[0].keys[ cDuck      ] ), STR_KEY_FIRST ),
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cDash      , SETTINGS( controls[0].keys[ cDash      ] ), STR_KEY_FIRST ),
 #endif
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cRoll      , SETTINGS( controls[0].keys[ cRoll      ] ), STR_KEY_FIRST ),
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cInventory , SETTINGS( controls[0].keys[ cInventory ] ), STR_KEY_FIRST ),
+#ifndef __MIYOO__
     OptionItem( OptionItem::TYPE_KEY,    STR_CTRL_FIRST + cStart     , SETTINGS( controls[0].keys[ cStart     ] ), STR_KEY_FIRST ),
+#endif
 };
 
 static OptionItem optControlsPlayer[COUNT(optControls)];
@@ -1009,7 +1018,7 @@ struct Inventory {
             }
             case TR::Entity::INV_CONTROLS :
                 Core::settings.playerIndex = 0;
-                #ifdef INV_GAMEPAD_ONLY
+                #if defined(INV_GAMEPAD_ONLY) || defined(__MIYOO__)
                     Core::settings.ctrlIndex = 1;
                 #else
                     Core::settings.ctrlIndex = 0;
@@ -1288,6 +1297,18 @@ struct Inventory {
                     }
 
                     if (newKey != -1) {
+                    #ifdef __MIYOO__
+                        // Miyoo: a button taken from another action swaps with it,
+                        // so two actions never end up on the same button
+                        if (Core::settings.ctrlIndex == 1) {
+                            uint8 *target = (uint8*)&Core::settings + waitForKey->offset;
+                            Core::Settings::Controls &ctrl = Core::settings.controls[Core::settings.playerIndex];
+                            for (int c = 0; c < cMAX; c++) {
+                                if (&ctrl.keys[c].joy != target && ctrl.keys[c].joy == newKey)
+                                    ctrl.keys[c].joy = *target;
+                            }
+                        }
+                    #endif
                         waitForKey->setValue(newKey, &Core::settings);
                         waitForKey = NULL;
                         lastKey = key;
@@ -2138,6 +2159,12 @@ struct Inventory {
             #if defined(_OS_SWITCH) || defined(_OS_3DS) || defined(_OS_GCW0) || defined(_OS_XBOX) || defined(_OS_XB1)
                 bSelect = "A";
                 bBack   = "B";
+            #endif
+            #ifdef __MIYOO__
+                // Miyoo: the menus read the pad directly (see update: jkA selects,
+                // jkB goes back), whatever is set in Set Controls - the Y and A buttons
+                bSelect = STR[STR_JOY_FIRST + jkA];
+                bBack   = STR[STR_JOY_FIRST + jkB];
             #endif
 
             sprintf(buf, STR[STR_HELP_SELECT], bSelect);

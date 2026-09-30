@@ -384,18 +384,32 @@ static JoyKey miyooMiniKey(SDLKey sym) {
     }
 }
 
-// Buttons that share a core input: R1 (walk), and L2/R2, which sidestep the
-// way Tomb Raider does it - walk + left/right. Tracked so that releasing one
-// never cancels another still held (e.g. R1 held while tapping L2).
-static bool miyooR1, miyooL2, miyooR2, miyooLeft, miyooRight;
+// Each button's own core input is tracked here, so L2/R2 - which sidestep the
+// way Tomb Raider does it, walk + left/right - can share inputs without a
+// release cancelling a button still held (e.g. R1 held while tapping L2).
+// L2/R2 press the buttons that Walk and Left/Right are set to in Set Controls.
+static bool miyooHeld[jkMAX], miyooL2, miyooR2;
 // Menu is a modifier: Menu+R1 quick save, Menu+L1 quick load (the core's
 // own "5"/"9" keys, so its checks apply: no saving in the rings, etc).
 static bool miyooMenu, miyooQuickSave, miyooQuickLoad;
 
+static void miyooHold(bool *held, uint8 key) {
+    if (key > jkNone && key < jkMAX)
+        held[key] = true;
+}
+
 static void miyooUpdateShared() {
-    Input::setJoyDown(0, jkRB,    miyooR1 || miyooL2 || miyooR2);
-    Input::setJoyDown(0, jkLeft,  miyooLeft  || miyooL2);
-    Input::setJoyDown(0, jkRight, miyooRight || miyooR2);
+    bool held[jkMAX];
+    memcpy(held, miyooHeld, sizeof(held));
+    // L2/R2 are fixed sidesteps, not buttons to choose in Set Controls
+    if (!waitForKey) {
+        const Core::Settings::Controls &ctrl = Core::settings.controls[0];
+        if (miyooL2 || miyooR2) miyooHold(held, ctrl.keys[cWalk].joy);
+        if (miyooL2)            miyooHold(held, ctrl.keys[cLeft].joy);
+        if (miyooR2)            miyooHold(held, ctrl.keys[cRight].joy);
+    }
+    for (int i = jkA; i < jkMAX; i++)
+        Input::setJoyDown(0, JoyKey(i), held[i]); // only changes are applied
 }
 
 // Copying the finished frame to the framebuffer (SDL_Flip) takes ~4 ms: the
@@ -544,7 +558,7 @@ int main() {
                             Input::down[ik5] = false;
                             miyooQuickSave = false;
                         } else {
-                            miyooR1 = down;
+                            miyooHeld[jkRB] = down;
                             miyooUpdateShared();
                         }
                         break;
@@ -556,16 +570,24 @@ int main() {
                             Input::down[ik9] = false;
                             miyooQuickLoad = false;
                         } else {
-                            Input::setJoyDown(0, jkLB, down);
+                            miyooHeld[jkLB] = down;
+                            miyooUpdateShared();
                         }
                         break;
                     // Select - help screen (the core's "H" key, toggled on press)
                     case SDLK_RCTRL     : Input::down[ikH] = down; break;
                     case SDLK_TAB       : miyooL2    = down; miyooUpdateShared(); break; // L2 - Sidestep left
                     case SDLK_BACKSPACE : miyooR2    = down; miyooUpdateShared(); break; // R2 - Sidestep right
-                    case SDLK_LEFT      : miyooLeft  = down; miyooUpdateShared(); break;
-                    case SDLK_RIGHT     : miyooRight = down; miyooUpdateShared(); break;
-                    default             : Input::setJoyDown(0, miyooMiniKey(sym), down); break;
+                    case SDLK_LEFT      : miyooHeld[jkLeft]  = down; miyooUpdateShared(); break;
+                    case SDLK_RIGHT     : miyooHeld[jkRight] = down; miyooUpdateShared(); break;
+                    default             : {
+                        JoyKey key = miyooMiniKey(sym);
+                        if (key != jkNone) {
+                            miyooHeld[key] = down;
+                            miyooUpdateShared();
+                        }
+                        break;
+                    }
                 }
             }
         } else {
