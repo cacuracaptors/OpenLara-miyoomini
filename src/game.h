@@ -241,13 +241,13 @@ namespace Game {
         if (!level || TR::isTitleLevel(level->level.id) || TR::isCutsceneLevel(level->level.id)) {
             return;
         }
-        level->saveGame(level->level.id, true, false);
+        level->saveGame(level->level.id, true, false, true); // Miyoo: the quick save's own slot
     }
 
     void quickLoad(bool forced = false) {
         if (!level) return;
 
-        int slot = getSaveSlot(level->level.id, true);
+        int slot = getSaveSlot(level->level.id, true, true); // Miyoo: the quick save only, never the passport's
 
         if (slot == -1) {
             slot = getSaveSlot(level->level.id, false);

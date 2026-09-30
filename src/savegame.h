@@ -21,7 +21,8 @@ struct SaveItem {
 };
 
 struct SaveStats {
-    uint32 level:31;
+    uint32 level:30;
+    uint32 quick:1;      // Miyoo: checkpoint made by the quick save (Menu+R1), apart from the passport's
     uint32 checkpoint:1;
     uint32 time;
     uint32 distance;
@@ -101,6 +102,11 @@ struct SaveSlot {
         return ((SaveStats*)data)->checkpoint;
     }
 
+    // Miyoo: the quick save's own slot - only Menu+L1 loads it, the passport's list hides it
+    bool isQuick() const {
+        return isCheckpoint() && ((SaveStats*)data)->quick;
+    }
+
     static int cmp(const SaveSlot &a, const SaveSlot &b) {
         uint32 ia = *(uint32*)a.data; // level + checkpoint flag
         uint32 ib = *(uint32*)b.data;
@@ -158,7 +164,8 @@ uint8* writeSaveSlots(int &size) {
     return data;
 }
 
-void removeSaveSlot(TR::LevelID levelID, bool checkpoint) {
+// quick: -1 = every checkpoint, 0 = the passport's only, 1 = the quick save's only
+void removeSaveSlot(TR::LevelID levelID, bool checkpoint, int quick = -1) {
     TR::Version version = TR::getGameVersionByLevel(levelID);
 
     for (int i = 0; i < saveSlots.length; i++) {
@@ -169,7 +176,7 @@ void removeSaveSlot(TR::LevelID levelID, bool checkpoint) {
         if (TR::getGameVersionByLevel(id) != version)
             continue;
 
-        if (slot.isCheckpoint() || (!checkpoint && levelID == id)) {
+        if (slot.isCheckpoint() ? (quick < 0 || int(slot.isQuick()) == quick) : (!checkpoint && levelID == id)) {
             delete[] slot.data;
             saveSlots.remove(i);
             i--;
@@ -178,7 +185,7 @@ void removeSaveSlot(TR::LevelID levelID, bool checkpoint) {
     }
 }
 
-int getSaveSlot(TR::LevelID levelID, bool checkpoint) {
+int getSaveSlot(TR::LevelID levelID, bool checkpoint, bool quick = false) {
     TR::Version version = TR::getGameVersionByLevel(levelID);
 
     for (int i = 0; i < saveSlots.length; i++) {
@@ -189,7 +196,7 @@ int getSaveSlot(TR::LevelID levelID, bool checkpoint) {
         if (TR::getGameVersionByLevel(id) != version)
             continue;
 
-        if ((checkpoint && slot.isCheckpoint()) || (!checkpoint && levelID == id))
+        if ((checkpoint && slot.isCheckpoint() && slot.isQuick() == quick) || (!checkpoint && !slot.isCheckpoint() && levelID == id))
             return i;
     }
 

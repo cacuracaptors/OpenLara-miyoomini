@@ -25,7 +25,8 @@ rebuilt for it: precise, perspective-correct and spread over both CPU cores. Thi
   automatically on the first start, with a progress screen
 - Music with the GOG file names, as they come (no renaming), including the cutscene audio
 - A full PS1-style control scheme adapted to the Miyoo Mini Plus buttons
-- Save anywhere from the passport (Save Game), as in the PC game, plus quick save and quick load shortcuts
+- Save anywhere from the passport (Save Game), as in the PC game, plus a separate quick save slot
+- An in-game help screen listing the Miyoo Mini Plus buttons
 - Lara's Home narration, as in the PC game
 - 45 to 60 FPS
 
@@ -64,11 +65,14 @@ folder instead of `GAME.GOG`.
 | L1 (hold) | Look around with the D-pad |
 | R1 (hold) | Walk |
 | L2 / R2 | Sidestep left / right |
-| Select / Start | Inventory (pause) |
+| Start | Inventory (pause) |
+| Select | Show / hide the help screen |
 | Menu + R1 | Quick save |
 | Menu + L1 | Quick load |
 
-To save, open the passport in the inventory and choose "Save Game?" (its "Current Position" is on the Load Game page). To exit, choose "Exit to Title" and then "Exit Game". The Menu key alone does nothing,
+To save, open the passport in the inventory and choose "Save Game?" (its "Current Position" is on the Load Game page). The quick save
+(Menu + R1) has its own slot: it is loaded only with Menu + L1 and does not show up on the Load Game page, so
+the two never overwrite each other. To exit, choose "Exit to Title" and then "Exit Game". The Menu key alone does nothing,
 so the OnionOS Menu+Power screenshot combo is safe to use at any time.
 
 ## Cheats
@@ -96,6 +100,7 @@ They don't work in Lara's Home, in cutscenes or on the title screen.
 
 ## Changelog
 
+- **v1.0.3** - The quick save (Menu + R1) and the passport's Save Game now use separate slots: the quick save is loaded only with Menu + L1, and the passport save only from the Load Game page. Select now shows the help screen, rewritten with the Miyoo Mini Plus buttons (Start still opens the inventory).
 - **v1.0.2** - Fixed enemies getting stuck running in place near some edges (the bears in City of Vilcabamba): they are now kept away from walls the way the original game does it.
 - **v1.0.1** - Shadows under Lara and the enemies. Lara's Home narration now plays. Save the game from the passport, as in the PC game (the PlayStation save crystals are gone). Picking up items fixed: only the nearest one, from close by, with no more teleports (and keys stay in their keyholes). The picked-up item spinning in the corner is drawn correctly. Pushable blocks can only be grabbed from their own level (standing on top of one, Lara was pulled down to grab it).
 - **v1.0.0** - Initial release: Tomb Raider 1.
@@ -135,6 +140,8 @@ and `OpenLara-sw` (stripped: the one shipped as `OpenLara` in the release). The 
   with translucency, and the per-room underwater palette and light shimmer
 - **`src/level.h`**, **`src/controller.h`** - effect sprites placed correctly in fixed-function renderers,
   per-room water palette, sky backdrop for the software renderer
+- **`src/savegame.h`**, **`src/game.h`** - separate save slots for the quick save and the passport's Save Game
+- **`src/lang.h`** - the help screen text with the Miyoo Mini Plus buttons
 - **`src/gameflow.h`** - TR1 music mapped onto the 9 PC CD tracks, GOG file names accepted
 - **`src/sound.h`** - MP3/OGG decoder fixes (buffered PCM, stereo output)
 - **`src/format.h`**, **`src/collision.h`**, **`src/utils.h`**, **`src/ui.h`**, **`src/inventory.h`** - case-insensitive file

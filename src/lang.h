@@ -294,6 +294,27 @@ enum StringID {
 #define STR_SCALE "25", "50", "75", "100"
 
 static char helpText[1024];
+#ifdef __MIYOO__
+// Miyoo Mini Plus: this port's buttons instead of the PC keyboard (the font
+// has no "+" or brackets, so combos use "&"; the %s of the PC text is unused)
+const char *helpTextFormat =
+    "D-Pad - Move@"
+    "B - Jump@"
+    "Y - Action@"
+    "A - Roll@"
+    "X - Draw or holster weapons@"
+    "L1 - Look@"
+    "R1 - Walk@"
+    "L2 / R2 - Step left / right@"
+    "Start - Inventory@"
+    "Select - Show or hide this help@"
+    "Menu & R1 - Quick save@"
+    "Menu & L1 - Quick load@"
+    "Swan dive - Up & R1 & B@"
+    "Handstand - hold R1 while climbing up@"
+    "Out of water - Up & Y@"
+    "First person view - hold L1, press Y";
+#else
 const char *helpTextFormat =
     "Start - add second player or restore Lara@"
     "H - Show or hide this help@"
@@ -313,6 +334,7 @@ const char *helpTextFormat =
     "DOZY on - Look & Duck & Action & Jump@"
     "DOZY off - Walk@"
     "Free Camera - hold L & R stick";
+#endif
 inline const char* getKeyName(InputKey key) {
     static const char* keyNames[] = {
         STR_KEYS  

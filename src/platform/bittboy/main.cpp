@@ -375,9 +375,9 @@ static JoyKey miyooMiniKey(SDLKey sym) {
         case SDLK_SPACE  : return jkB;      // A (right)  - Roll
         case SDLK_LSHIFT : return jkY;      // X (top)    - Draw/holster weapon
         case SDLK_e      : return jkLB;     // L1         - Look
-        case SDLK_RETURN : return jkSelect; // Start      - Inventory too: TR1 on OpenLara has no pause,
+        case SDLK_RETURN : return jkSelect; // Start      - Inventory: TR1 on OpenLara has no pause,
                                              //              the rings act as one (jkStart only adds a 2nd player)
-        case SDLK_RCTRL  : return jkSelect; // Select     - Inventory
+                                             // Select is the help screen, see the event loop
         case SDLK_UP     : return jkUp;
         case SDLK_DOWN   : return jkDown;
         default          : return jkNone;
@@ -559,6 +559,8 @@ int main() {
                             Input::setJoyDown(0, jkLB, down);
                         }
                         break;
+                    // Select - help screen (the core's "H" key, toggled on press)
+                    case SDLK_RCTRL     : Input::down[ikH] = down; break;
                     case SDLK_TAB       : miyooL2    = down; miyooUpdateShared(); break; // L2 - Sidestep left
                     case SDLK_BACKSPACE : miyooR2    = down; miyooUpdateShared(); break; // R2 - Sidestep right
                     case SDLK_LEFT      : miyooLeft  = down; miyooUpdateShared(); break;

@@ -354,6 +354,9 @@ struct Inventory {
                 if (TR::getGameVersionByLevel(id) != (level->version & TR::VER_VERSION))
                     continue;
 
+                if (slot.isQuick()) // Miyoo: the quick save is loaded only with Menu+L1
+                    continue;
+
                 OptionItem item;
                 item.type   = OptionItem::TYPE_BUTTON;
                 item.offset = slot.isCheckpoint() ? STR_CURRENT_POSITION : TR::LEVEL_INFO[id].title;
@@ -1045,7 +1048,7 @@ struct Inventory {
                         } else {
                             // save the game, as the PC game's passport does (the save
                             // crystals were a PlayStation feature): the "Current
-                            // Position" slot, the one the quick save uses
+                            // Position" of the load list, apart from the quick save
                             game->saveGame(id, true, false);
                             game->playSound(TR::SND_INV_PAGE);
                             toggle();

@@ -123,7 +123,7 @@ struct Level : IGame {
         inventory->toggle(playerIndex, Inventory::Page(page));
     }
 
-    SaveSlot createSaveSlot(TR::LevelID id, bool checkpoint, bool dummy = false) {
+    SaveSlot createSaveSlot(TR::LevelID id, bool checkpoint, bool dummy = false, bool quick = false) {
         SaveSlot slot;
 
         // allocate oversized data for save slot
@@ -140,6 +140,7 @@ struct Level : IGame {
             *stats = saveStats;
         stats->level      = id;
         stats->checkpoint = checkpoint;
+        stats->quick      = checkpoint && quick;
         ptr += sizeof(*stats);
 
     // inventory items
@@ -286,7 +287,7 @@ struct Level : IGame {
         }
     }
 
-    virtual void saveGame(TR::LevelID id, bool checkpoint, bool updateStats) {
+    virtual void saveGame(TR::LevelID id, bool checkpoint, bool updateStats, bool quick = false) {
         ASSERT(saveResult != SAVE_RESULT_WAIT);
 
         if (saveResult == SAVE_RESULT_WAIT)
@@ -307,8 +308,10 @@ struct Level : IGame {
             stats->level      = level.id;
             stats->checkpoint = checkpoint;
         } else {
-            removeSaveSlot(id, checkpoint); // remove checkpoints and level saves
-            saveSlots.push(createSaveSlot(id, checkpoint));
+            // a checkpoint replaces only its own kind (quick save or passport);
+            // a level save removes both, as before
+            removeSaveSlot(id, checkpoint, checkpoint ? int(quick) : -1);
+            saveSlots.push(createSaveSlot(id, checkpoint, false, quick));
         }
 
         saveSlots.sort();

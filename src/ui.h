@@ -788,7 +788,11 @@ namespace UI {
             textOut(vec2(32, 32), helpText, aLeft, width - 32, 255, UI::SHADE_GRAY);
         } else {
             if (helpTipTime > 0.0f) {
+            #ifdef __MIYOO__
+                textOut(vec2(0, height - 16), "Press Select for help", aCenter, width, 255, UI::SHADE_ORANGE);
+            #else
                 textOut(vec2(0, height - 16), STR_HELP_PRESS, aCenter, width, 255, UI::SHADE_ORANGE);
+            #endif
             }
         }
     #endif
