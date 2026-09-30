@@ -95,8 +95,6 @@ They don't work in Lara's Home, in cutscenes or on the title screen.
 - The PC version of Tomb Raider has 9 music tracks (the menu theme, the ambient themes and the cutscenes); the
   in-level music of the PlayStation version was never part of it.
 - Large, busy areas may run below 60 FPS.
-- Tomb Raider 2 and 3 are not supported yet: OpenLara's support for them is still incomplete (most Tomb
-  Raider 2 enemies have no AI, and climbing walls is not implemented). They are planned for future updates.
 - If the game crashes, a `crash_log.txt` file is created in the `Tomb Raider 1` folder - please attach it to
   your report. The game's log is in `log.txt`, in the same folder.
 
