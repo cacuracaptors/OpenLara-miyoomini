@@ -2147,7 +2147,7 @@ struct Level : IGame {
         int roomIndex = controller->getRoomIndex();
         TR::Room &room = level.rooms[roomIndex];
 
-        if (controller->flags.invisible)
+        if (controller->flags.invisible || controller->isHiddenAI())
             return;
 
         if (!entity.isLara() && !entity.isActor() && !room.flags.visible)

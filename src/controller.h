@@ -630,6 +630,8 @@ struct Controller {
         return !flags.reverse;
     }
 
+    virtual bool isHiddenAI() { return false; } // an enemy without an AI slot (TR2+)
+
     virtual bool isCollider() {
         const TR::Entity &e = getEntity();
         return e.isEnemy() ||

@@ -10,6 +10,15 @@
 
 #define MAX_SHOT_DIST   (64 * 1024)
 
+// TR2+: the original game gives "AI" to only 5 creatures at a time
+// (LOT_EnableBaddieAI); the others stand still and hidden until they get a slot
+#define ENEMY_AI_SLOTS 5
+
+struct Enemy;
+static Enemy *enemyAISlots[ENEMY_AI_SLOTS];
+
+// random numbers of the AIs: the original's random range is 0..32767, so every
+// draw is masked to it (rand() goes much higher on Linux)
 struct Enemy : Character {
 
     struct Path {
@@ -80,17 +89,109 @@ struct Enemy : Character {
         targetDist   = +INF;
         targetInView = targetFromView = targetCanAttack = false;
         waypoint     = pos;
+        aiSlot       = false;
+        aiHidden     = false;
+        aiWake       = false;
     }
 
     virtual ~Enemy() {
+        aiRelease();
         delete path;
+    }
+
+    // ---- the original's AI slots (TR2+) -----------------------------------
+    bool aiSlot;    // has one of the slots (the original's creature_data)
+    bool aiHidden;  // lost it to a nearer creature: frozen and not drawn
+                    // (without a slot and not hidden: "sleeping", frozen and
+                    // drawn until a trigger wakes it)
+    bool aiWake;    // loaded from a save while active: takes a slot
+
+    bool aiLimited() const {
+        return (level->version & TR::VER_VERSION) > TR::VER_TR1;
+    }
+
+    void aiRelease() {
+        for (int i = 0; i < ENEMY_AI_SLOTS; i++)
+            if (enemyAISlots[i] == this)
+                enemyAISlots[i] = NULL;
+        aiSlot = false;
+    }
+
+    float aiCameraDist2() {
+        ICamera *camera = game->getCamera();
+        vec3 c = camera ? camera->eye.pos : pos;
+        return (pos - c).length2();
+    }
+
+    // LOT_EnableBaddieAI: a free slot, or the one of the creature farthest from
+    // the camera when this one is nearer (or always, when a trigger wakes it)
+    bool aiAcquire(bool always) {
+        if (aiSlot)
+            return true;
+
+        for (int i = 0; i < ENEMY_AI_SLOTS; i++) {
+            Enemy *e = enemyAISlots[i];
+            if (!e || e->health <= 0.0f || e->flags.state != TR::Entity::asActive) {
+                if (e) e->aiSlot = false;
+                enemyAISlots[i] = this;
+                aiSlot   = true;
+                aiHidden = false;
+                return true;
+            }
+        }
+
+        float worstDist = always ? 0.0f : aiCameraDist2();
+        int   worst     = -1;
+        for (int i = 0; i < ENEMY_AI_SLOTS; i++) {
+            float d = enemyAISlots[i]->aiCameraDist2();
+            if (d > worstDist) {
+                worstDist = d;
+                worst     = i;
+            }
+        }
+        if (worst < 0)
+            return false;
+
+        enemyAISlots[worst]->aiSlot   = false;
+        enemyAISlots[worst]->aiHidden = true;
+        enemyAISlots[worst] = this;
+        aiSlot   = true;
+        aiHidden = false;
+        return true;
+    }
+
+    virtual bool isHiddenAI() {
+        return aiHidden;
+    }
+
+    // Creature_Activate
+    virtual void update() {
+        if (aiLimited()) {
+            if (aiWake) {
+                aiWake = false;
+                aiAcquire(true);
+            }
+            if (health <= 0.0f) {
+                aiRelease();        // the dead need no slot
+                aiHidden = false;
+            } else if (aiHidden) {
+                if (!aiAcquire(false))
+                    return;         // still no slot: frozen and hidden
+            } else if (!aiSlot)
+                return;             // sleeping until a trigger wakes it
+        }
+        Character::update();
     }
 
     virtual bool getSaveData(SaveEntity &data) {
         Character::getSaveData(data);
         data.extraSize = sizeof(data.extra.enemy);
         data.extra.enemy.health    = health;
-        data.extra.enemy.spec.mood = mood;
+        data.extra.enemy.spec.value    = 0;
+        data.extra.enemy.spec.mood     = mood;
+        data.extra.enemy.spec.aiKnown  = 1;
+        data.extra.enemy.spec.aiSlot   = aiSlot;
+        data.extra.enemy.spec.aiHidden = aiHidden;
         data.extra.enemy.targetBox = targetBox;
         return true;
     }
@@ -101,10 +202,32 @@ struct Enemy : Character {
         mood      = Mood(data.extra.enemy.spec.mood);
         targetBox = data.extra.enemy.targetBox;
         updateZone();
+        // the original saves which creatures had AI and gives it back to just
+        // those; a sleeping one stays asleep until its trigger
+        bool alive = aiLimited() && health > 0.0f && flags.state == TR::Entity::asActive;
+        aiRelease();
+        if (data.extra.enemy.spec.aiKnown) {
+            aiWake   = alive && data.extra.enemy.spec.aiSlot;
+            aiHidden = alive && data.extra.enemy.spec.aiHidden;
+        } else {
+            aiWake   = alive;   // a save from before this: as the lote 1i
+            aiHidden = false;
+        }
     }
 
+    // Item_Activate: a trigger wakes it (also when it is already in the list
+    // of active entities, sleeping)
     virtual bool activate() {
-        return health > 0.0f && Character::activate();
+        if (health <= 0.0f)
+            return false;
+        bool res = Character::activate();
+        if (aiLimited()) {
+            if (!aiHidden)
+                aiAcquire(true);    // sleeping: always gets a slot
+            else
+                aiAcquire(false);   // hidden: only if there is one for it
+        }
+        return res;
     }
 
     virtual void updateVelocity() {
@@ -319,9 +442,7 @@ struct Enemy : Character {
 
     // TR2+: random numbers in the original's 0..32767 range
     int randTR() {
-        if ((level->version & TR::VER_VERSION) <= TR::VER_TR1)
-            return rand();
-        return rand() & 0x7FFF;
+        return rand() & 0x7FFF;     // the original's random range (0..32767), on any platform
     }
 
     Mood getMoodFixed() {
@@ -390,7 +511,9 @@ struct Enemy : Character {
             targetBox = TR::NO_BOX;
         }
 
-        mood = target->health <= 0 ? MOOD_SLEEP : (ai == AI_FIXED ? getMoodFixed() : getMoodRandom());
+        // violent (the original's Creature_Mood(..., true)) when the creature asks
+        // for it - each one passes it in think(...), as the original does
+        mood = target->health <= 0 ? MOOD_SLEEP : ((fixedLogic || ai == AI_FIXED) ? getMoodFixed() : getMoodRandom());
 
     // set behavior and target
         int box;
@@ -630,7 +753,7 @@ struct Wolf : Enemy {
             case STATE_SLEEP    :
                 if (mood == MOOD_ESCAPE || target->zone == zone)
                     nextState = STATE_GROWL;
-                else if (rand() < 32)
+                else if ((rand() & 0x7FFF) < 32)
                     nextState = STATE_WALK;
                 else
                     break;
@@ -641,7 +764,7 @@ struct Wolf : Enemy {
                     nextState = STATE_NONE;
                     return STATE_STALK;
                 }
-                if (rand() < 32) {
+                if ((rand() & 0x7FFF) < 32) {
                     nextState = STATE_SLEEP;
                     return STATE_STOP;
                 }
@@ -661,7 +784,7 @@ struct Wolf : Enemy {
                     if (!targetInView || targetFromView || targetDist > WOLF_DIST_ATTACK)
                         return STATE_RUN;
                 }
-                if (rand() < 384) {
+                if ((rand() & 0x7FFF) < 384) {
                     nextState = STATE_HOWL;
                     return STATE_GROWL;
                 }
@@ -745,6 +868,8 @@ struct Lion : Enemy {
     };
 
     Lion(IGame *game, int entity) : Enemy(game, entity, 6, 341, 400.0f, 0.25f) {
+        if (getEntity().type == TR::Entity::ENEMY_LION_MALE)
+            aggression = 1.0f;      // the original's smartness: 0x7FFF (lioness and puma 0x2000)
         dropHeight = -1024;
         jointChest = 19;
         jointHead  = 20;
@@ -879,7 +1004,7 @@ struct Gorilla : Enemy {
     }
 
     virtual int getStateGround() {
-        if (!think(true))
+        if (!think(false))      // ape.c: not violent
             return state;
         
         if (nextState == state)
@@ -911,7 +1036,7 @@ struct Gorilla : Enemy {
                     return STATE_STOP;
                 }
                 if (mood != MOOD_ESCAPE) {
-                    int r = rand();
+                    int r = rand() & 0x7FFF;
                     if (r < 160)
                         nextState = STATE_JUMP;
                     else if (r < 320)
@@ -1172,7 +1297,7 @@ struct Rat : Enemy {
     }
 
     virtual int getStateOnwater() {
-        if (!think(false))
+        if (!think(true))       // rat.c, the vole in the water: violent
             return state;
 
         if (nextState == state)
@@ -1365,7 +1490,7 @@ struct Crocodile : Enemy {
     }
 
     virtual int getStateUnderwater() {
-        if (!think(false))
+        if (!think(true))       // crocodile.c, the alligator in the water: violent
             return state;
 
         if (nextState == state)
@@ -2018,7 +2143,7 @@ struct Mutant : Enemy {
                 if (mood == MOOD_ATTACK || mood == MOOD_ESCAPE)
                     return STATE_STOP;
                 if (mood == MOOD_SLEEP || (mood == MOOD_STALK && target->zone != zone)) {
-                    if (rand() < 50)
+                    if ((rand() & 0x7FFF) < 50)
                         return STATE_LOOKING;
                 } else if (mood == MOOD_STALK && targetDist > MUTANT_DIST_STALK)
                     return STATE_STOP;
@@ -2042,12 +2167,12 @@ struct Mutant : Enemy {
                     return STATE_STOP;
                 switch (mood) {
                     case MOOD_SLEEP :
-                        if (rand() < 256)
+                        if ((rand() & 0x7FFF) < 256)
                             return STATE_WALK;
                         break;
                     case MOOD_STALK :
                         if (targetDist < MUTANT_DIST_STALK) {
-                            if (target->zone == zone && rand() < 256)
+                            if (target->zone == zone && (rand() & 0x7FFF) < 256)
                                 return STATE_WALK;
                         } else
                             return STATE_STOP;
@@ -2367,7 +2492,7 @@ struct Centaur : Enemy {
                     nextState = STATE_AIM;
                     return STATE_STOP;
                 }
-                if (rand() < 96) {
+                if ((rand() & 0x7FFF) < 96) {
                     nextState = STATE_IDLE;
                     return STATE_STOP;
                 }
@@ -2874,13 +2999,13 @@ struct SkaterBoy : Human {
                 return STATE_MOVE;
             case STATE_MOVE :
                 flags.unused = 0;
-                if (rand() < 512)
+                if ((rand() & 0x7FFF) < 512)
                     return STATE_STEP;
                 if (targetIsVisible(HUMAN_DIST_SHOT))
                     return (mood != MOOD_ESCAPE && targetDist > SKATERBOY_DIST_MIN && targetDist < SKATERBOY_DIST_MAX) ? STATE_STOP : STATE_MOVE_FIRE;
                 break;
             case STATE_STEP :
-                if (rand() < 1024)
+                if ((rand() & 0x7FFF) < 1024)
                     return STATE_MOVE;
                 break;
             case STATE_STAND_FIRE :
@@ -3116,7 +3241,7 @@ struct Natla : Human {
         timer += Core::deltaTime;
         bool canShot = target && target->health > 0.0f && targetIsVisible(HUMAN_DIST_SHOT);
 
-        if (canShot && state == STATE_FLY && flying && rand() < 256)
+        if (canShot && state == STATE_FLY && flying && (rand() & 0x7FFF) < 256)
             flags.unused &= ~FLAG_FLY;
         else if (!canShot)
             flags.unused |= FLAG_FLY;
@@ -3317,7 +3442,7 @@ struct Tiger : Enemy {
         STATE_ATTACK_3 ,
     };
 
-    Tiger(IGame *game, int entity) : Enemy(game, entity, 20, 341, 200.0f, 0.25f) {
+    Tiger(IGame *game, int entity) : Enemy(game, entity, 20, 341, 200.0f, 1.0f) {   // smartness -1 in the original: always for Lara
         dropHeight = -1024;
         jointChest = -1;//21;
         jointHead  = -1;//22;
@@ -3336,7 +3461,7 @@ struct Tiger : Enemy {
                 if (mood == MOOD_ESCAPE)
                     return STATE_RUN;
                 if (mood == MOOD_SLEEP) {
-                    int r = rand();
+                    int r = rand() & 0x7FFF;
                     if (r < TIGER_ROAR) return STATE_ROAR;
                     if (r < TIGER_WALK) return STATE_WALK;
                     return state;
@@ -3347,13 +3472,13 @@ struct Tiger : Enemy {
                     return STATE_ATTACK_3;
                 if (nextState != STATE_NONE)
                     return nextState;
-                if (mood != MOOD_ATTACK && rand() < TIGER_ROAR)
+                if (mood != MOOD_ATTACK && (rand() & 0x7FFF) < TIGER_ROAR)
                     return STATE_ROAR;
                 return STATE_RUN;
             case STATE_WALK     : 
                 if (mood == MOOD_ATTACK || mood == MOOD_ESCAPE)
                     return STATE_RUN;
-                if (rand() < TIGER_ROAR) {
+                if ((rand() & 0x7FFF) < TIGER_ROAR) {
                     nextState = STATE_ROAR;
                     return STATE_STOP;
                 }
@@ -3372,7 +3497,7 @@ struct Tiger : Enemy {
                     else
                         return STATE_ATTACK_2;
                 }
-                if (mood != MOOD_ATTACK && rand() < TIGER_ROAR) {
+                if (mood != MOOD_ATTACK && (rand() & 0x7FFF) < TIGER_ROAR) {
                     nextState = STATE_ROAR;
                     return STATE_STOP;
                 }
@@ -3778,7 +3903,7 @@ struct Winston : Enemy {
             flags.unused &= ~2;
         }
 
-        if (rand() < 0x100) {
+        if ((rand() & 0x7FFF) < 0x100) {
             game->playSound(TR::SND_WINSTON_TRAY, pos, Sound::PAN);
         }
 

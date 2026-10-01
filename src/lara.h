@@ -1494,7 +1494,7 @@ struct Lara : Character {
                 continue;
 
             Character *enemy = (Character*)c;
-            if (!enemy->isActiveTarget())
+            if (!enemy->isActiveTarget() || enemy->isHiddenAI())
                 continue;
 
             Box box = enemy->getBoundingBox();
@@ -2812,6 +2812,8 @@ struct Lara : Character {
     bool isRealLedge(float floor) {
         if ((level->version & TR::VER_VERSION) <= TR::VER_TR1)
             return true;
+        if (!climbStatus)
+            return true;    // only a climbable wall shows the false ledges
         vec3 p = pos + getDir() * 512.0f;   // past the wall face, on the ledge
         p.y = floor - 128.0f;               // just above it
         int16 r = getRoomIndex();
@@ -4107,7 +4109,7 @@ struct Lara : Character {
 
             Controller *controller = (Controller*)e.controller;
 
-            if (!controller || controller->flags.invisible || !controller->isCollider()) continue;
+            if (!controller || controller->flags.invisible || controller->isHiddenAI() || !controller->isCollider()) continue;
 
             if (e.type == TR::Entity::TRAP_DOOR_1 || e.type == TR::Entity::TRAP_DOOR_2) continue;
 

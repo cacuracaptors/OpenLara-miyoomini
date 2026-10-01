@@ -69,7 +69,7 @@ struct SaveEntity {
             float  health;
             uint16 targetBox;
             union {
-                struct { uint16 mood:3; };
+                struct { uint16 mood:3, aiKnown:1, aiSlot:1, aiHidden:1; }; // TR2+: the AI slot (lote 1j)
                 uint16 value;
             } spec;
         } enemy;
