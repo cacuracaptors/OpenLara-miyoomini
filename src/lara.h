@@ -2547,7 +2547,7 @@ struct Lara : Character {
             float ceiling = c.info[Collision::FRONT].ceiling;
             float hands   = bounds.min.y;
 
-            if (fabsf(floor - hands) < 64 && int(floor) != int(ceiling)) {
+            if (fabsf(floor - hands) < 64 && int(floor) != int(ceiling) && isRealLedge(floor)) {
                 alignToWall(-LARA_RADIUS);
                 pos.y = float(floor + LARA_HANG_OFFSET);
                 stand = STAND_HANG;
@@ -2804,6 +2804,21 @@ struct Lara : Character {
         } else if (r && useRightAlone)
             l = r;
         return l;
+    }
+
+    // TR2+: the ledge found in front, checked at its own height (the floor
+    // lookup of the collision ignores the height, so a floor of another storey
+    // of the room could pass for a ledge in the middle of a climbable wall)
+    bool isRealLedge(float floor) {
+        if ((level->version & TR::VER_VERSION) <= TR::VER_TR1)
+            return true;
+        vec3 p = pos + getDir() * 512.0f;   // past the wall face, on the ledge
+        p.y = floor - 128.0f;               // just above it
+        int16 r = getRoomIndex();
+        TR::Room::Sector *s = level->getSector(r, p);
+        if (!s || s->floor == TR::NO_FLOOR)
+            return false;
+        return fabsf(level->getFloor(s, p) - floor) < 64.0f;
     }
 
     bool testClimbStance(int &shift) {
@@ -3219,13 +3234,18 @@ struct Lara : Character {
             }
         }
 
+        // caught a climbable wall in the air: wait for the climbing stance
+        if (climbGrab && state == STATE_HANG)
+            return STATE_HANG;
+
         if (input & LEFT)  return STATE_HANG_LEFT;
         if (input & RIGHT) return STATE_HANG_RIGHT;
         if (input & FORTH) {
-            // possibility check
+            // possibility check (TR2+: and a ledge that really is there, at
+            // the hands' height - not a floor of another storey of the room)
             TR::Level::FloorInfo info;
             getFloorInfo(getRoomIndex(), pos + getDir() * (LARA_RADIUS + 2.0f), info);
-            if (info.floor - info.ceiling >= LARA_HEIGHT)
+            if (info.floor - info.ceiling >= LARA_HEIGHT && isRealLedge(pos.y - LARA_HANG_OFFSET))
                 return (input & WALK) ? STATE_HANDSTAND : STATE_HANG_UP;            
         }
         return STATE_HANG;

@@ -70,6 +70,8 @@ struct KeyItemInv : Controller {
 };
 
 #define DART_DAMAGE 50
+#define SND_TR2_DISC           254   // TR2 shoots metal discs instead of darts
+#define SND_TR2_PROJECTILE_HIT 258
 
 struct Dart : Controller {
     vec3 velocity;
@@ -84,6 +86,8 @@ struct Dart : Controller {
     virtual void update() {
         velocity = dir * animation.getSpeed();
         pos = pos + velocity * (Core::deltaTime * 30.0f);
+        if (level->version & TR::VER_TR2)
+            angle.x += (PI / 8.0f) * 30.0f * Core::deltaTime;
 
         Controller *lara = game->getLara(pos);
         if (armed && collide(lara)) {
@@ -94,6 +98,8 @@ struct Dart : Controller {
         TR::Level::FloorInfo info;
         getFloorInfo(getRoomIndex(), pos, info);
         if (pos.y > info.floor || pos.y < info.ceiling || !insideRoom(pos, getRoomIndex())) {
+            if (level->version & TR::VER_TR2)
+                game->playSound(SND_TR2_PROJECTILE_HIT, pos, Sound::PAN);
             game->addEntity(TR::Entity::RICOCHET, getRoomIndex(), pos - dir * 64.0f); // with wall offset
             game->removeEntity(this);
         }
@@ -120,7 +126,7 @@ struct TrapDartEmitter : Controller {
             game->addEntity(TR::Entity::DART, getRoomIndex(), p, angle.y);
             if (level->extra.smoke != -1)
                 game->addEntity(TR::Entity::SMOKE, getRoomIndex(), p);
-            game->playSound(TR::SND_DART, p, Sound::PAN);
+            game->playSound((level->version & TR::VER_TR2) ? SND_TR2_DISC : TR::SND_DART, p, Sound::PAN);
         }
 
         updateAnimation(true);
@@ -972,6 +978,152 @@ struct TrapSwingBlade : Controller {
             return;
 
         lara->hit(BLADE_DAMAGE * 30.0f * Core::deltaTime, this, TR::HIT_BLADE);
+    }
+};
+
+// ---- TR2 traps (the original game's behaviour) --------------------------------
+
+#define SND_TR2_SPIKE_WALL       204
+#define SND_TR2_ROLLING_BLADE    231
+
+// wall-mounted blade: cuts at leg height while its trigger is on
+#define BLADE_WALL_DAMAGE        100   // per frame while touching, as the original
+
+struct TrapBladeWall : Controller {
+    enum {
+        STATE_STOP = 1,
+        STATE_CUT  = 2,
+    };
+
+    enum {
+        ANIM_SET = 2,
+    };
+
+    TrapBladeWall(IGame *game, int entity) : Controller(game, entity) {
+        animation.setAnim(ANIM_SET);
+    }
+
+    virtual void update() {
+        // as the original: cut when stopped and triggered, otherwise head back
+        // to stop - so with the trigger on it cuts, returns and cuts again
+        if (isActive() && state == STATE_STOP)
+            animation.setState(STATE_CUT);
+        else
+            animation.setState(STATE_STOP);
+
+        if (state == STATE_CUT) {
+            Character *lara = (Character*)game->getLara(pos);
+            if (lara && (collide(lara) & 2))    // the blade's mesh 1
+                lara->hit(BLADE_WALL_DAMAGE * 30.0f * Core::deltaTime, this, TR::HIT_BLADE);
+        }
+
+        updateAnimation(true);
+    }
+};
+
+// spinning blade: rolls along the floor until the next wall, then turns around
+#define SPINNING_BLADE_DAMAGE    100   // per frame while touching
+
+struct TrapSpinningBlade : Controller {
+    enum {
+        STATE_STOP = 1,
+        STATE_SPIN = 2,
+    };
+
+    enum {
+        ANIM_STOP = 3,
+    };
+
+    bool stopping;
+
+    TrapSpinningBlade(IGame *game, int entity) : Controller(game, entity), stopping(false) {
+        animation.setAnim(ANIM_STOP);
+    }
+
+    virtual void update() {
+        bool flip = false;
+
+        if (state == STATE_SPIN) {
+            if (!stopping) {
+                vec3 p = pos + getDir() * 1536.0f;
+                int16 r = roomIndex;
+                TR::Room::Sector *sector = level->getSector(r, p);
+                if (!sector || sector->floor == TR::NO_FLOOR)
+                    stopping = true;
+            }
+            // the original keeps the goal until an animation takes it (the
+            // start animation has no way to stop, the spinning loop has)
+            if (stopping)
+                animation.setState(STATE_STOP);
+
+            flip = true;
+
+            Character *lara = (Character*)game->getLara(pos);
+            if (lara && collide(lara))
+                lara->hit(SPINNING_BLADE_DAMAGE * 30.0f * Core::deltaTime, this, TR::HIT_BLADE);
+
+            game->playSound(SND_TR2_ROLLING_BLADE, pos, Sound::PAN | Sound::UNIQUE);
+        } else {
+            stopping = false;
+            if (isActive())
+                animation.setState(STATE_SPIN);
+        }
+
+        updateAnimation(true);
+
+        // the animation moves it forward, on the floor
+        pos += getDir() * (animation.getSpeed() * 30.0f * Core::deltaTime);
+        int16 r = roomIndex;
+        TR::Room::Sector *sector = level->getSector(r, pos);
+        if (sector && sector->floor != TR::NO_FLOOR) {
+            float floor = level->getFloor(sector, pos, &r);
+            if (floor != float(TR::NO_FLOOR * 256)) {
+                pos.y = floor;
+                roomIndex = r;
+            }
+        }
+
+        if (flip && state == STATE_STOP)
+            angle.y += PI;
+    }
+};
+
+// spike wall: slides forward while its trigger is on, until it meets a wall
+#define SPIKE_WALL_SPEED         16.0f  // per frame
+#define SPIKE_WALL_DAMAGE        20     // per frame while touching
+
+struct TrapSpikeWall : Controller {
+    bool finished;
+
+    TrapSpikeWall(IGame *game, int entity) : Controller(game, entity), finished(false) {}
+
+    virtual void update() {
+        if (!isActive()) {
+            if (finished || pos != vec3(float(getEntity().x), float(getEntity().y), float(getEntity().z))) {
+                const TR::Entity &e = getEntity();
+                pos       = vec3(float(e.x), float(e.y), float(e.z));
+                roomIndex = e.room;
+                finished  = false;
+            }
+        } else if (!finished) {
+            vec3 p = pos + getDir() * (SPIKE_WALL_SPEED * 30.0f * Core::deltaTime);
+            int16 r = roomIndex;
+            TR::Room::Sector *sector = level->getSector(r, p);
+            if (!sector || int(level->getFloor(sector, p)) != int(p.y)) {
+                finished = true;
+                Sound::stop(SND_TR2_SPIKE_WALL);
+            } else {
+                pos       = p;
+                roomIndex = r;
+                game->playSound(SND_TR2_SPIKE_WALL, pos, Sound::PAN | Sound::UNIQUE);
+            }
+        }
+
+        Character *lara = (Character*)game->getLara(pos);
+        if (lara && collide(lara))
+            lara->hit(SPIKE_WALL_DAMAGE * 30.0f * Core::deltaTime, this, TR::HIT_SPIKES);
+
+        updateAnimation(true);
     }
 };
 

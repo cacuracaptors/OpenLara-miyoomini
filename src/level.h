@@ -1313,9 +1313,7 @@ struct Level : IGame {
             case TR::Entity::ENEMY_GOON_STICK_2     :
             case TR::Entity::ENEMY_GOON_FLAME       :
             case TR::Entity::UNUSED_23              :
-            case TR::Entity::ENEMY_SPIDER           :
             case TR::Entity::ENEMY_SPIDER_GIANT     :
-            case TR::Entity::ENEMY_CROW             :
             case TR::Entity::ENEMY_MARCO            :
             case TR::Entity::ENEMY_GUARD_SPEAR        :
             case TR::Entity::ENEMY_GUARD_SPEAR_STATUE :
@@ -1331,6 +1329,11 @@ struct Level : IGame {
             case TR::Entity::ENEMY_MONK_1           :
             case TR::Entity::ENEMY_MONK_2           : return new Enemy(this, index, 100, 10, 0.0f, 0.0f);
             case TR::Entity::ENEMY_WINSTON          : return new Winston(this, index);
+            case TR::Entity::ENEMY_SPIDER           : return new Spider(this, index);
+            case TR::Entity::ENEMY_CROW             : return new Crow(this, index);
+            case TR::Entity::TRAP_BLADE_WALL        : return new TrapBladeWall(this, index);
+            case TR::Entity::TRAP_SPINDLE           : return new TrapSpinningBlade(this, index);
+            case TR::Entity::TRAP_SPIKES_WALL       : return new TrapSpikeWall(this, index);
 
             case TR::Entity::CRYSTAL_PICKUP         : return new CrystalPickup(this, index);
             case TR::Entity::STONE_ITEM_1           :

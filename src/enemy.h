@@ -306,8 +306,26 @@ struct Enemy : Character {
             game->addEntity(TR::Entity::BLOOD, target->getRoomIndex(), getJoint(joint) * offset);
     }
 
+    // TR2+: is the target in this enemy's zone, as the enemy's own pathing sees
+    // it (flyers and jumpers use other zone tables than Lara's), like the
+    // original. TR1 keeps its old comparison.
+    bool targetInZone() {
+        if ((level->version & TR::VER_VERSION) <= TR::VER_TR1)
+            return zone == target->zone;
+        if (target->box < 0 || target->box == TR::NO_BOX)
+            return false;
+        return getZones()[target->box] == zone;
+    }
+
+    // TR2+: random numbers in the original's 0..32767 range
+    int randTR() {
+        if ((level->version & TR::VER_VERSION) <= TR::VER_TR1)
+            return rand();
+        return rand() & 0x7FFF;
+    }
+
     Mood getMoodFixed() {
-        bool inZone = zone == target->zone;
+        bool inZone = targetInZone();
 
         if (mood == MOOD_SLEEP || mood == MOOD_STALK)
             return inZone ? MOOD_ATTACK : (wound ? MOOD_ESCAPE : mood);
@@ -319,8 +337,8 @@ struct Enemy : Character {
     }
 
     Mood getMoodRandom() {
-        bool inZone = zone == target->zone;
-        bool brave  = rand() < (mood != MOOD_ESCAPE ? 0x7800 : 0x0100) && inZone;
+        bool inZone = targetInZone();
+        bool brave  = randTR() < (mood != MOOD_ESCAPE ? 0x7800 : 0x0100) && inZone;
             
         if (mood == MOOD_SLEEP || mood == MOOD_STALK) {
             if (wound && !brave)
@@ -360,7 +378,7 @@ struct Enemy : Character {
 
         int targetBoxOld = targetBox;
 
-        bool inZone = zone == target->zone;
+        bool inZone = targetInZone();
 
         if (target->health <= 0.0f || !inZone)
             targetBox = TR::NO_BOX;
@@ -3388,6 +3406,275 @@ struct Tiger : Enemy {
         Enemy::updatePosition();
         setOverrides(true, jointChest, jointHead);
         lookAt(target);
+    }
+};
+
+
+// ---- TR2: spider -------------------------------------------------------------
+// The original game's spider: 5 hit points, a 25-damage bite, bursts into
+// pieces when killed. Chance values are the original's (x / 32768 per frame).
+
+#define SPIDER_TURN          (DEG2RAD * 240)   // 8 degrees per frame
+#define SPIDER_DIST_ATTACK_2 512.0f
+#define SPIDER_DIST_ATTACK_3 204.0f
+#define SPIDER_DAMAGE        25
+#define SPIDER_CHANCE_WALK   (256.0f / 32768.0f)
+#define SND_TR2_SPIDER_EXPLODE 349
+
+struct Spider : Enemy {
+
+    enum {
+        STATE_NONE     ,
+        STATE_STOP     ,
+        STATE_WALK     ,
+        STATE_RUN      ,
+        STATE_ATTACK_1 ,
+        STATE_ATTACK_2 ,
+        STATE_ATTACK_3 ,
+        STATE_DEATH    ,
+    };
+
+    Spider(IGame *game, int entity) : Enemy(game, entity, 5, 102, 0.0f, 0.25f) {
+        stepHeight =  512;      // the original's "jumper" pathing
+        dropHeight = -1024;
+        jointChest = -1;
+        jointHead  = -1;
+    }
+
+    virtual void setSaveData(const SaveEntity &data) {
+        Enemy::setSaveData(data);
+        if (flags.invisible)
+            deactivate(true);
+    }
+
+    virtual int getStateGround() {
+        if (!think(false))
+            return state;
+
+        switch (state) {
+            case STATE_STOP :
+                flags.unused = 0;
+                if (mood == MOOD_SLEEP) {
+                    if (randf() < SPIDER_CHANCE_WALK)
+                        return STATE_WALK;
+                } else if (targetInView && collide(target))
+                    return STATE_ATTACK_1;
+                else if (mood == MOOD_STALK)
+                    return STATE_WALK;
+                else
+                    return STATE_RUN;
+                break;
+            case STATE_WALK :
+                if (mood == MOOD_SLEEP) {
+                    if (randf() < SPIDER_CHANCE_WALK)
+                        return STATE_STOP;
+                } else if (mood == MOOD_ATTACK || mood == MOOD_ESCAPE)
+                    return STATE_RUN;
+                break;
+            case STATE_RUN :
+                flags.unused = 0;
+                if (mood == MOOD_SLEEP || mood == MOOD_STALK)
+                    return STATE_WALK;
+                if (targetInView && collide(target))
+                    return STATE_STOP;
+                if (targetInView && targetDist < SPIDER_DIST_ATTACK_3)
+                    return STATE_ATTACK_3;
+                if (targetInView && targetDist < SPIDER_DIST_ATTACK_2)
+                    return STATE_ATTACK_2;
+                break;
+            case STATE_ATTACK_1 :
+            case STATE_ATTACK_2 :
+            case STATE_ATTACK_3 :
+                if (!flags.unused && collide(target)) {
+                    bite(1, vec3(0.0f, 0.0f, 41.0f), SPIDER_DAMAGE);
+                    flags.unused = 1;
+                }
+                break;
+            default : ;
+        }
+        return state;
+    }
+
+    virtual int getStateDeath() {
+        return state;           // no death animation: it bursts (see update)
+    }
+
+    virtual void updatePosition() {
+        turn(state == STATE_WALK || state == STATE_RUN, SPIDER_TURN);
+        if (health <= 0.0f)
+            return;
+        Enemy::updatePosition();
+    }
+
+    virtual void update() {
+        bool exploded = explodeMask != 0;
+
+        if (health <= 0.0f && !exploded && !flags.invisible) {
+            game->playSound(SND_TR2_SPIDER_EXPLODE, pos, Sound::PAN);
+            explode(0xffffffff, 0.0f, false);   // body parts, no flames
+        }
+
+        Enemy::update();
+
+        if (exploded && !explodeMask) {
+            deactivate(true);
+            flags.invisible = true;
+        }
+    }
+};
+
+
+// ---- TR2: crow ---------------------------------------------------------------
+// The original game's crow: starts on the ground eating, flies to Lara and
+// pecks (20 damage), falls to the ground when killed.
+
+#define CROW_TURN            (DEG2RAD * 90)    // 3 degrees per frame
+#define CROW_LIFT_SPEED      480.0f            // 16 units per frame
+#define CROW_DIST_ATTACK     512.0f
+#define CROW_DAMAGE          20
+
+struct Crow : Enemy {
+
+    enum {
+        ANIM_DEATH = 1,
+        ANIM_START = 14,
+    };
+
+    enum {
+        STATE_NONE   ,
+        STATE_FLY    ,
+        STATE_STOP   ,
+        STATE_GLIDE  ,
+        STATE_FALL   ,
+        STATE_DEATH  ,
+        STATE_ATTACK ,
+        STATE_EAT    ,
+    };
+
+    Crow(IGame *game, int entity) : Enemy(game, entity, 15, 204, 0.0f, 0.25f) {
+        stand      = STAND_AIR;
+        flying     = true;
+        stepHeight =  20 * 1024;
+        dropHeight = -20 * 1024;
+        jointChest = -1;
+        jointHead  = -1;
+        animation.setAnim(ANIM_START);
+    }
+
+    float floorHeight() {
+        int16 r = getRoomIndex();
+        TR::Room::Sector *sector = level->getSector(r, pos);    // follows the height
+        return sector ? level->getFloor(sector, pos) : pos.y;
+    }
+
+    // the highest floor on the rest of its way to the target
+    float pathHighestFloor() {
+        float h = waypoint.y;
+        if (box >= 0 && box != TR::NO_BOX)
+            h = min(h, float(level->boxes[box].floor));
+        if (path) {
+            for (int i = max(0, int(path->index) - 1); i < path->count; i++)
+                h = min(h, float(level->boxes[path->boxes[i]].floor));
+        }
+        return h;
+    }
+
+    // horizontal distance to Lara, as the original's attack range
+    float crowDistH() {
+        if (!target) return +INF;
+        vec3 d = target->pos - pos;
+        return sqrtf(d.x * d.x + d.z * d.z);
+    }
+
+    virtual int getStateAir() {
+        if (!think(false))
+            return state;
+
+        switch (state) {
+            case STATE_FLY :
+                flags.unused = 0;
+                if (mood == MOOD_SLEEP)
+                    return STATE_STOP;
+                if (targetInView && crowDistH() < CROW_DIST_ATTACK)
+                    return STATE_ATTACK;
+                return STATE_GLIDE;
+            case STATE_STOP :
+            case STATE_EAT  :
+                if (mood != MOOD_SLEEP)
+                    return STATE_FLY;
+                break;
+            case STATE_GLIDE :
+                if (mood == MOOD_SLEEP)
+                    return STATE_FLY;   // lands from the flight state
+                if (targetInView && crowDistH() < CROW_DIST_ATTACK)
+                    return STATE_ATTACK;
+                break;
+            case STATE_ATTACK :
+                if (!flags.unused && collide(target)) {
+                    bite(14, vec3(2.0f, 10.0f, 60.0f), CROW_DAMAGE);
+                    flags.unused = 1;
+                }
+                break;
+            default : ;
+        }
+        return state;
+    }
+
+    virtual int getStateGround() {
+        return getStateAir();
+    }
+
+    virtual int getStateDeath() {
+        if (state == STATE_DEATH)
+            return state;
+        if (state == STATE_FALL)
+            return (stand == STAND_GROUND) ? STATE_DEATH : state;
+        flying = false;                 // falls with gravity
+        stand  = STAND_AIR;
+        return animation.setAnim(ANIM_DEATH);
+    }
+
+    virtual void updatePosition() {
+        turn(state == STATE_FLY || state == STATE_GLIDE || state == STATE_ATTACK, CROW_TURN);
+
+        if (!target)
+            target = (Character*)game->getLara(pos);
+
+        if (health > 0.0f) {
+            // landed: on the floor, as the original. Eating is only the
+            // starting pose: it stays where the level put it (the floor found
+            // here can be the one of a room far below, e.g. the tiger's pit)
+            if (state == STATE_STOP)
+                pos.y = floorHeight();
+            else if (target) {
+                // the original's flight heights: Lara's head when attacking,
+                // otherwise a block above the floor of its path
+                // (the original's Box_CalculateTarget: a flyer keeps a block
+                // above the floor of the boxes on its way, and goes straight
+                // for its target only inside the target's own box)
+                float wy = pathHighestFloor() - 1024.0f;
+                if (mood == MOOD_ATTACK) {
+                    float head = target->pos.y - (target->stand != STAND_ONWATER ? 762.0f : 64.0f);
+                    wy = (box == target->box) ? head : min(wy, head);
+                }
+                lift(wy - pos.y, CROW_LIFT_SPEED);
+            }
+        }
+
+        Enemy::updatePosition();
+
+        if (state == STATE_DEATH)
+            pos.y = floorHeight();
+    }
+
+    virtual void deactivate(bool removeFromList = false) {
+        if (health <= 0.0f) {
+            float floor = floorHeight();
+            if (floor > pos.y)
+                return;         // still falling
+            pos.y = floor;
+        }
+        Enemy::deactivate(removeFromList);
     }
 };
 

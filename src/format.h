@@ -3888,7 +3888,7 @@ namespace TR {
                 if (version & (VER_TR1 | VER_TR2)) {
                     uint16 v;
                     stream.read(v); s.volume = float(v) / 0x7FFF;
-                    stream.read(v); s.chance = float(v) / 0xFFFF;
+                    stream.read(v); s.chance = (version & VER_TR1) ? float(v) / 0xFFFF : min(1.0f, float(v) / 0x7FFF); // TR2: 0..32767, as the original
                     s.range = 8 * 1024;
                     s.pitch = 0.2f;
                 } else {

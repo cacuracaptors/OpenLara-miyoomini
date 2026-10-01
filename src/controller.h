@@ -150,6 +150,7 @@ struct Controller {
         vec3  velocity;
         float damage;
         int16 roomIndex;
+        bool  fire;     // bursts into flame when it lands (TR1); TR2 body parts just vanish
     } *explodeParts;
 
     vec3 lastPos;
@@ -1256,7 +1257,8 @@ struct Controller {
 
                 if (explode) {
                     explodeMask &= ~(1 << i);
-                    game->addEntity(TR::Entity::EXPLOSION, part.roomIndex, p);
+                    if (part.fire)
+                        game->addEntity(TR::Entity::EXPLOSION, part.roomIndex, p);
                 }
             }
 
@@ -1353,7 +1355,7 @@ struct Controller {
         return matrix;
     }
 
-    void explode(int32 mask, float damage) {
+    void explode(int32 mask, float damage, bool fire = true) {
         const TR::Model *model = getModel();
 
         if (!layers) initMeshOverrides();
@@ -1385,6 +1387,7 @@ struct Controller {
             part.basis.w   = 1.0f;
             part.velocity  = vec3(cosf(angle) * speed.x, speed.y, sinf(angle) * speed.x);
             part.damage    = damage;
+            part.fire      = fire;
             part.roomIndex = roomIndex;
         }
     }
