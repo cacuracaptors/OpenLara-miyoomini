@@ -48,6 +48,7 @@ int osGetTimeMS() {
 // device accepts parameter sets it does not honour, which played the game
 // pitched down and distorted; MI_AO takes the mixer's 44.1 kHz stereo as is.
 #include <unistd.h>
+#include <sched.h>
 #include <mi_sys.h>
 #include <mi_ao.h>
 
@@ -412,6 +413,51 @@ static void miyooUpdateShared() {
         Input::setJoyDown(0, JoyKey(i), held[i]); // only changes are applied
 }
 
+// ---- vsync -------------------------------------------------------------------
+// The framebuffer holds 3 pages (640x1440) and panning to another page happens
+// at the panel's vsync (FBIOPAN_DISPLAY waits for it, 16.75 ms apart). Each
+// finished frame is copied into the hidden page and the panel is pointed at it:
+// the page on screen is never written while the panel draws it - no tearing.
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/fb.h>
+
+static int               fbFd    = -1;
+static fb_var_screeninfo fbVar;
+static uint8            *fbMem   = NULL;
+static int               fbPage  = 0;      // the page on screen
+static bool              fbVsync = false;
+
+// back to page 0, where OnionOS draws (on exit and on a crash)
+static void fbRestore() {
+    if (fbFd >= 0 && fbVsync && fbVar.yoffset != 0) {
+        fbVar.yoffset = 0;
+        ioctl(fbFd, FBIOPAN_DISPLAY, &fbVar);
+    }
+}
+
+static void fbInit() {
+    fbFd = open("/dev/fb0", O_RDWR);
+    if (fbFd < 0) { fprintf(stderr, "vsync: off (no /dev/fb0)\n"); return; }
+    fb_fix_screeninfo fix;
+    if (ioctl(fbFd, FBIOGET_VSCREENINFO, &fbVar) || ioctl(fbFd, FBIOGET_FSCREENINFO, &fix) ||
+        fbVar.xres != SCREEN_WIDTH || fbVar.yres != SCREEN_HEIGHT || fbVar.bits_per_pixel != 32 ||
+        fix.line_length != SCREEN_WIDTH * 4 || fbVar.yres_virtual < SCREEN_HEIGHT * 2 ||
+        fix.smem_len < SCREEN_WIDTH * 4 * SCREEN_HEIGHT * 2) {
+        fprintf(stderr, "vsync: off (framebuffer %dx%d virtual %dx%d)\n", fbVar.xres, fbVar.yres, fbVar.xres_virtual, fbVar.yres_virtual);
+        return;
+    }
+    void *mem = mmap(NULL, fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fbFd, 0);
+    if (mem == MAP_FAILED) { fprintf(stderr, "vsync: off (mmap failed)\n"); return; }
+    fbMem   = (uint8*)mem;
+    fbPage  = (fbVar.yoffset >= (unsigned)SCREEN_HEIGHT) ? 1 : 0;
+    fbVsync = true;
+    fallout::crashHook = fbRestore;
+    atexit(fbRestore);
+    fprintf(stderr, "vsync: on (2 framebuffer pages)\n");
+}
+
 // Copying the finished frame to the framebuffer (SDL_Flip) takes ~4 ms: the
 // framebuffer is uncached memory. Do it on a thread of its own, so it overlaps
 // with the next frame's input, game update and vertex work; the main thread
@@ -424,6 +470,7 @@ static bool            flipStarted = false;
 static SDL_Surface    *flipScreen  = NULL;
 static const GAPI::ColorSW *flipSrc = NULL;
 
+
 static void* flipProc(void *arg) {
     for (;;) {
         pthread_mutex_lock(&flipMutex);
@@ -431,8 +478,16 @@ static void* flipProc(void *arg) {
         pthread_mutex_unlock(&flipMutex);
 
         // copy the finished (already rotated) frame into the screen
-        if (SDL_MUSTLOCK(flipScreen)) SDL_LockSurface(flipScreen);
         const GAPI::ColorSW *src = flipSrc;
+        if (fbVsync) {
+            // into the hidden page, then show it at the next vsync (waits for it)
+            const int back = fbPage ^ 1;
+            memcpy(fbMem + back * SCREEN_HEIGHT * SCREEN_WIDTH * 4, src, SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+            fbVar.yoffset = back * SCREEN_HEIGHT;
+            ioctl(fbFd, FBIOPAN_DISPLAY, &fbVar);
+            fbPage = back;
+        } else {
+        if (SDL_MUSTLOCK(flipScreen)) SDL_LockSurface(flipScreen);
         if (flipScreen->pitch == SCREEN_WIDTH * 4) {
             memcpy(flipScreen->pixels, src, SCREEN_WIDTH * SCREEN_HEIGHT * 4);
         } else {
@@ -442,6 +497,7 @@ static void* flipProc(void *arg) {
         }
         if (SDL_MUSTLOCK(flipScreen)) SDL_UnlockSurface(flipScreen);
         if (!(flipScreen->flags & SDL_HWSURFACE)) SDL_Flip(flipScreen);
+        }
 
         pthread_mutex_lock(&flipMutex);
         flipPending = false;
@@ -512,6 +568,7 @@ int main() {
         fprintf(stderr, "screen: WARNING unexpected pitch, rendering assumes %d\n", SCREEN_WIDTH * 4);
     }
     flipScreen      = screen;
+    fbInit();     // vsync through the framebuffer's pages, if the panel allows
     GAPI::swPresent = presentFrame;
     swBuffer = new uint16[SCREEN_WIDTH * SCREEN_HEIGHT];
 
@@ -600,14 +657,30 @@ int main() {
                 GAPI::swFrameEnd();
 
                 // The panel refreshes at 60 Hz, so anything faster only burns
-                // battery and heat. Wait out the rest of a ~16 ms frame.
-                {
-                    static Uint32 lastFrame = 0;
-                    Uint32 elapsed = SDL_GetTicks() - lastFrame;
-                    if (lastFrame && elapsed < 16) {
-                        SDL_Delay(16 - elapsed);
+                // battery and heat. Frames follow a 60 Hz schedule (16667 us).
+                // This kernel wakes sleepers on a 10 ms tick: sleeping for the
+                // rest of the frame ended every frame at 20 ms (50 FPS). So it
+                // sleeps only while a whole tick still fits before the deadline,
+                // then waits out the rest (under 10 ms) yielding the core.
+                if (!fbVsync) {   // with vsync the panel itself sets the pace
+                    // counted from the end of the previous frame: a late frame
+                    // waits for nothing, a quick one only up to 16.7 ms
+                    static long long last = 0;                  // microseconds
+                    const long long FRAME_US = 16667;
+                    long long now = GAPI::swPerfNow();
+                    long long deadline = last + FRAME_US;
+                    if (last && now < deadline) {
+                        for (;;) {
+                            long long left = deadline - now;
+                            if (left <= 0) break;
+                            if (left > 11000) usleep(1000);     // wakes on the next tick
+                            else              sched_yield();
+                            now = GAPI::swPerfNow();
+                        }
+                        last = deadline;
+                    } else {
+                        last = now;
                     }
-                    lastFrame = SDL_GetTicks();
                 }
             }
         }
@@ -622,6 +695,7 @@ int main() {
     // and raw keyboard mode after quitting, which looked like a freeze.
     GAPI::swDrain();
     flipWait();
+    fbRestore();
     SDL_Quit();
 
     return 0;

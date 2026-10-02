@@ -12,6 +12,10 @@ namespace fallout {
 // without needing gdb/gdbserver connected live at the time of the crash.
 void installCrashHandler();
 
+// Called from the crash handler, before the process dies (e.g. to put the
+// screen back the way the system expects it). Must be async-signal-safe.
+extern void (*crashHook)();
+
 } // namespace fallout
 
 #endif /* FALLOUT_CRASH_HANDLER_H_ */

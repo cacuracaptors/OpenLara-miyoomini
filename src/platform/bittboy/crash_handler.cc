@@ -13,6 +13,8 @@
 
 namespace fallout {
 
+void (*crashHook)() = NULL;
+
 #ifdef CRASH_HANDLER_HAVE_BACKTRACE
 
 static const int kCrashSignals[] = { SIGSEGV, SIGABRT, SIGFPE, SIGBUS, SIGILL };
@@ -82,6 +84,8 @@ static void crashHandlerSignal(int signum, siginfo_t* info, void* context)
 
         close(fd);
     }
+
+    if (crashHook) crashHook();
 
     // SA_RESETHAND already restored the default action, so re-raising lets
     // the OS terminate the process normally.

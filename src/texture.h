@@ -13,6 +13,7 @@ struct Texture : GAPI::Texture {
 
             Texture(Tile8 *tiles, int tilesCount) : GAPI::Texture(256, 256, 1, OPT_PROXY) {
                 this->tiles = tiles;
+                GAPI::swRegisterTiles(tiles, tilesCount);   // the renderer's copy in 8x8 blocks
             }
         #elif defined(_GAPI_GU)
             Tile4 *tiles;
@@ -135,6 +136,9 @@ struct Texture : GAPI::Texture {
     }
 
     virtual ~Texture() {
+        #if defined(_GAPI_SW) && defined(SPLIT_BY_TILE)
+            if (tiles) GAPI::swUnregisterTiles(tiles);
+        #endif
         #if !defined(_GAPI_SW) && !defined(_GAPI_GU)
             #ifdef SPLIT_BY_TILE
                 for (int i = 0; i < COUNT(tiles); i++)

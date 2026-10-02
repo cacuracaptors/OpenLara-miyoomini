@@ -53,7 +53,17 @@ namespace GAPI {
     // 16-bit: 1/w * 2^21 (resolution ~0.5 units at 1024 units away). Half
     // the memory traffic of the float buffer, which mattered: this device's
     // memory is slow and both cores share it.
+    // Depth: the 24-bit 1/w kept in 16 bits as a tiny float (4-bit exponent,
+    // 12-bit mantissa), see depthCodeSW: the same precision (1/4096) at every
+    // distance, where the plain top 16 bits lost it far away (z-fighting).
     typedef uint16 DepthSW;
+
+    // monotonic: a larger 1/w (closer) always gives a larger or equal code
+    static inline int32 depthCodeSW(int32 z) {
+        if (z < 4096) return z;
+        const int m = 31 - __builtin_clz(uint32(z));   // 12..23
+        return ((m - 11) << 12) | ((z >> (m - 12)) & 0xFFF);
+    }
 
     uint8   *swLightmap;
     uint8   swLightmapNone[32 * 256];
@@ -85,6 +95,7 @@ namespace GAPI {
 
 // Texture
     void swDrain();
+    uint32 swTexVersion = 0;   // unique for every new texture content
 
     struct Texture {
         uint8      *memory;
@@ -92,7 +103,9 @@ namespace GAPI {
         TexFormat  fmt;
         uint32     opt;
 
-        Texture(int width, int height, int depth, uint32 opt) : memory(0), width(width), height(height), origWidth(width), origHeight(height), fmt(FMT_RGBA), opt(opt) {}
+        uint32     version;    // changes with the pixels: the background blit cache checks it
+
+        Texture(int width, int height, int depth, uint32 opt) : memory(0), width(width), height(height), origWidth(width), origHeight(height), fmt(FMT_RGBA), opt(opt), version(0) {}
 
         void init(void *data) {
             ASSERT((opt & OPT_PROXY) == 0);
@@ -100,6 +113,7 @@ namespace GAPI {
             opt &= ~(OPT_CUBEMAP | OPT_MIPMAPS);
 
             memory = new uint8[width * height * 4];
+            version = ++swTexVersion;
             if (data) {
                 // Two conventions reach this point. Texture::Load creates the
                 // texture at its power-of-two size with padded pixels (and fixes
@@ -140,6 +154,7 @@ namespace GAPI {
             for (int y = 0; y < origHeight; y++) {
                 memcpy(memory + y * width * 4, src + y * origWidth * 4, origWidth * 4);
             }
+            version = ++swTexVersion;
         }
 
         void bind(int sampler) {
@@ -665,6 +680,8 @@ namespace GAPI {
         const uint8 *texels;                               // triangles
         Texture     *tex;                                  // triangles, blit
         bool         affine, ortho, testZ, writeZ;
+        bool         tiled;                                // triangles: texels in 8x8 blocks
+        uint32       blitKey;                              // blit: which image (for the cache)
         bool         water;                                // triangles: use the underwater palette
         bool         shadow;                               // triangles: darken instead of texturing
         short4       clip;
@@ -721,6 +738,53 @@ namespace GAPI {
         swRec = &swFrames[0];
     }
 
+    // Texture pages stored in 8x8 blocks of 64 bytes, one cache line each: a
+    // span crossing a page vertically or diagonally reads far fewer cache
+    // lines than with plain 256-byte rows. Same texels, another order; the
+    // level's own pages stay untouched (other code reads them).
+    struct TiledPagesSW {
+        const Tile8 *orig;
+        Tile8       *tiled;
+        int          count;
+    };
+    TiledPagesSW swTiled = { NULL, NULL, 0 };
+
+    // always inside the 256x256 page (a coordinate one step off the edge wraps,
+    // as the plain rows' "+ (u >> 16)" stays near it)
+    static inline int tiledIndexSW(int tu, int tv) {
+        return ((tv & 0xF8) << 8) | ((tu & 0xF8) << 3) | ((tv & 7) << 3) | (tu & 7);
+    }
+
+    // division by 16 rounding toward zero, exactly as "/ 16" (a plain ">> 4"
+    // rounds negative numbers down: a stretch could end past its last texel)
+    static inline int32 div16SW(int32 d) {
+        return (d + ((d >> 31) & 15)) >> 4;
+    }
+
+    void swRegisterTiles(const Tile8 *tiles, int count) {
+        swDrain();
+        delete[] swTiled.tiled;
+        swTiled.orig  = tiles;
+        swTiled.count = count;
+        swTiled.tiled = new Tile8[count];
+        for (int i = 0; i < count; i++) {
+            const uint8 *src = tiles[i].index;
+            uint8       *dst = swTiled.tiled[i].index;
+            for (int tv = 0; tv < 256; tv++)
+                for (int tu = 0; tu < 256; tu++)
+                    dst[tiledIndexSW(tu, tv)] = src[(tv << 8) + tu];
+        }
+    }
+
+    void swUnregisterTiles(const Tile8 *tiles) {
+        if (swTiled.orig != tiles) return;
+        swDrain();
+        delete[] swTiled.tiled;
+        swTiled.orig  = NULL;
+        swTiled.tiled = NULL;
+        swTiled.count = 0;
+    }
+
     struct RasterCtxSW {
         const FrameSW *frame;
         ColorSW       *colorEnd;
@@ -729,6 +793,7 @@ namespace GAPI {
         Texture       *tex;
         const ColorSW *pal;      // scene palette for this batch (dry or underwater)
         bool           affine, ortho, testZ, writeZ;
+        bool           tiled;
         bool           shadow;
         short4         clip;
         int            band;     // 0: main core, 1: worker core
@@ -781,7 +846,7 @@ namespace GAPI {
                 int32 u = int32(fu), v = int32(fv);
                 if (u < 0) u = 0; else if (u > UV_MAX) u = UV_MAX;
                 if (v < 0) v = 0; else if (v > UV_MAX) v = UV_MAX;
-                uint8 index = texels[((v >> 16) << 8) + (u >> 16)];
+                uint8 index = ctx.tiled ? texels[tiledIndexSW(u >> 16, v >> 16)] : texels[((v >> 16) << 8) + (u >> 16)];
                 if (index == 0) continue;
                 int32 li = int32(fl) >> (16 + 3);
                 if ((uint32)li > 31u) li = li < 0 ? 0 : 31;
@@ -809,22 +874,34 @@ namespace GAPI {
 
     // The innermost loop, generated for each depth test/write combination so
     // the per-pixel code carries no checks whose answer never changes.
-    template <bool TEST_Z, bool WRITE_Z>
+    // FLAT_LIGHT: the light level is the same over the whole stretch (both ends
+    // fall in the same one of the 32 levels, and it changes linearly), so its
+    // row of the light table is picked once - the very same pixels.
+    // ZCODE: z is the plain 1/w and the depth code is worked out per pixel
+    // (a stretch crossing from one exponent to the next); otherwise z already
+    // is the code, in 8.8 fixed point, stepped linearly.
+    template <bool TEST_Z, bool WRITE_Z, bool TILED, bool FLAT_LIGHT, bool ZCODE>
     static inline void spanPixelsSW(int &x, int len, ColorSW *color, DepthSW *depth,
                                     const uint8 *texels, const uint8 *lightSel, const ColorSW *palWorld,
                                     int32 u, int32 du, int32 v, int32 dv, int32 lv, int32 dl, int32 z, int32 dz) {
-        for (int k = 0; k < len; k++, x++) {
-            if (!TEST_Z || (z >> 8) >= depth[x]) {
-                const uint8 index = texels[((v >> 16) << 8) + (u >> 16)];
+        ColorSW     *c    = color - x;                      // mirrored: walks down
+        DepthSW     *d    = (TEST_Z || WRITE_Z) ? depth + x : NULL;
+        const uint8 *lrow = lightSel + ((lv >> 19) << 8);
+        x += len;
+        for (int k = len; k > 0; k--, c--) {
+            const int32 zc = (TEST_Z || WRITE_Z) ? (ZCODE ? depthCodeSW(z) : (z >> 8)) : 0;
+            if (!TEST_Z || zc >= int32(*d)) {
+                const uint8 index = TILED ? texels[tiledIndexSW(u >> 16, v >> 16)] : texels[((v >> 16) << 8) + (u >> 16)];
                 if (index != 0) {
-                    color[-x] = palWorld[lightSel[((lv >> 19) << 8) + index]];
-                    if (WRITE_Z) depth[x] = DepthSW(z >> 8);
+                    *c = palWorld[FLAT_LIGHT ? lrow[index] : lightSel[((lv >> 19) << 8) + index]];
+                    if (WRITE_Z) *d = DepthSW(zc);
                 }
             }
-            u  += du;
-            v  += dv;
-            z  += dz;
-            lv += dl;
+            if (TEST_Z || WRITE_Z) d++;
+            u += du;
+            v += dv;
+            z += dz;
+            if (!FLAT_LIGHT) lv += dl;
         }
     }
 
@@ -841,7 +918,7 @@ namespace GAPI {
             if (depth) {
                 int32 z = int32(pq * 536870912.0f);
                 if (z < 0) z = 0; else if (z > (65535 << 8)) z = 65535 << 8;
-                if ((z >> 8) < depth[x]) continue;
+                if (depthCodeSW(z) < int32(depth[x])) continue;
             }
             const ColorSW c = color[-x];
             color[-x] = (sizeof(ColorSW) == 4) ? ColorSW((c >> 1) & 0x7F7F7F) : ColorSW((c >> 1) & 0x7BEF);
@@ -869,6 +946,7 @@ namespace GAPI {
         const bool     testZ    = depth && ctx.testZ;
         const bool     writeZ   = depth && ctx.writeZ;
         const bool     affine   = ctx.affine;
+        const bool     tiled    = ctx.tiled && !affine;
         const uint8   *lightSel = ctx.frame->lightSel;
         const ColorSW *palWorld = ctx.pal;
         const int32    UV_MAX   = (256 << 16) - 1;
@@ -876,6 +954,24 @@ namespace GAPI {
         const int32    Z_MAX    = (65535 << 8);
 
         float invA = 1.0f / (pq < 1e-6f ? 1e-6f : pq);
+
+        // the start of each stretch is the end of the last one: only the first
+        // stretch converts its start (float to integer is slow on this CPU)
+        int32 ua, va, lvA, zA;
+        if (affine) {
+            ua = int32(pu);
+            va = int32(pv);
+        } else {
+            ua = int32(pu * invA);
+            va = int32(pv * invA);
+        }
+        if (ua < 0) ua = 0; else if (ua > UV_MAX) ua = UV_MAX;
+        if (va < 0) va = 0; else if (va > UV_MAX) va = UV_MAX;
+        lvA = int32(l);
+        if (lvA < 0) lvA = 0; else if (lvA > LV_MAX) lvA = LV_MAX;
+        zA = int32(pq * 536870912.0f);
+        if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
+
         int x = x0;
         while (x < x1) {
             int len = x1 - x;
@@ -886,47 +982,68 @@ namespace GAPI {
             float pq1 = pq + pQ.dx * float(len);
             float l1  = l  + pL.dx * float(len);
 
-            int32 ua, va, ub, vb;
+            int32 ub, vb;
             if (affine) {
-                ua = int32(pu);  va = int32(pv);
                 ub = int32(pu1); vb = int32(pv1);
             } else {
                 float qb   = pq1 < 1e-6f ? 1e-6f : pq1;
                 float invB = 1.0f / qb;
-                ua = int32(pu  * invA); va = int32(pv  * invA);
                 ub = int32(pu1 * invB); vb = int32(pv1 * invB);
                 invA = invB;
             }
-            if (ua < 0) ua = 0; else if (ua > UV_MAX) ua = UV_MAX;
             if (ub < 0) ub = 0; else if (ub > UV_MAX) ub = UV_MAX;
-            if (va < 0) va = 0; else if (va > UV_MAX) va = UV_MAX;
             if (vb < 0) vb = 0; else if (vb > UV_MAX) vb = UV_MAX;
-            int32 lvA = int32(l), lvB = int32(l1);
-            if (lvA < 0) lvA = 0; else if (lvA > LV_MAX) lvA = LV_MAX;
+            int32 lvB = int32(l1);
             if (lvB < 0) lvB = 0; else if (lvB > LV_MAX) lvB = LV_MAX;
-            int32 zA = int32(pq * 536870912.0f), zB = int32(pq1 * 536870912.0f);
-            if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
+            int32 zB = int32(pq1 * 536870912.0f);
             if (zB < 0) zB = 0; else if (zB > Z_MAX) zB = Z_MAX;
 
+            // steps: a shift for the usual 16-pixel stretch instead of a division
             int32 u  = ua, v = va;
-            int32 du = (ub - ua) / len;
-            int32 dv = (vb - va) / len;
-            int32 lv = lvA;
-            int32 dl = (lvB - lvA) / len;
-            int32 z  = zA;
-            int32 dz = (zB - zA) / len;
-
-            if (testZ) {
-                if (writeZ) spanPixelsSW<true,  true >(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
-                else        spanPixelsSW<true,  false>(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
+            int32 du, dv, dl, dz;
+            // depth: codes at both ends of the stretch; with the same exponent at
+            // both, the code follows 1/w linearly and is just stepped
+            const int32 zcA = depthCodeSW(zA) << 8, zcB = depthCodeSW(zB) << 8;
+            const bool  zcode = (zcA >> 20) != (zcB >> 20);   // crosses an exponent
+            const int32 zS = zcode ? zA : zcA, zE = zcode ? zB : zcB;
+            if (len == 16) {
+                du = div16SW(ub - ua);
+                dv = div16SW(vb - va);
+                dl = div16SW(lvB - lvA);
+                dz = div16SW(zE - zS);
             } else {
-                if (writeZ) spanPixelsSW<false, true >(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
-                else        spanPixelsSW<false, false>(x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz);
+                du = (ub - ua) / len;
+                dv = (vb - va) / len;
+                dl = (lvB - lvA) / len;
+                dz = (zE - zS) / len;
             }
+            int32 lv = lvA;
+            int32 z  = zS;
+
+            const bool flat = (lvA >> 19) == (lvB >> 19);
+            #define SW_ARGS x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz
+            #define SW_SPAN2(TZ, WZ, ZC) { \
+                if (tiled) { if (flat) spanPixelsSW<TZ, WZ, true,  true,  ZC>(SW_ARGS); else spanPixelsSW<TZ, WZ, true,  false, ZC>(SW_ARGS); } \
+                else       { if (flat) spanPixelsSW<TZ, WZ, false, true,  ZC>(SW_ARGS); else spanPixelsSW<TZ, WZ, false, false, ZC>(SW_ARGS); } }
+            #define SW_SPAN(TZ, WZ) { if (zcode) SW_SPAN2(TZ, WZ, true) else SW_SPAN2(TZ, WZ, false) }
+            if (testZ) {
+                if (writeZ) SW_SPAN(true,  true )
+                else        SW_SPAN(true,  false)
+            } else {
+                if (writeZ) SW_SPAN(false, true )
+                else        SW_SPAN(false, false)
+            }
+            #undef SW_SPAN
+            #undef SW_SPAN2
+            #undef SW_ARGS
             pu = pu1;
             pv = pv1;
             pq = pq1;
             l  = l1;
+            ua  = ub;
+            va  = vb;
+            lvA = lvB;
+            zA  = zB;
         }
     }
 
@@ -1036,13 +1153,45 @@ namespace GAPI {
         cmd->depth = depth;
     }
 
+    // Background blits (menus, loading screens, videos): the converted, scaled
+    // image is kept, row by row, and redone only when it changes.
+    ColorSW *swBlitCache  = NULL;
+    uint32  *swBlitRowKey = NULL;
+
     void swRecordBlit(Texture *tex, int sx0, int sy0, int sw, int sh, int ox0, int oy0, int ow, int oh) {
+        swInitFrames();
+        {   // a blit rewrites every row of the color buffer: earlier color work is lost
+            FrameSW &f = *swRec;
+            for (int i = 0; i < f.cmdCount; i++) {
+                CmdSW &c = f.cmds[i];
+                if (c.type == SW_CMD_BLIT) {
+                    c.type  = SW_CMD_CLEAR;     // nothing to do
+                    c.color = false;
+                    c.depth = false;
+                } else if (c.type == SW_CMD_CLEAR) {
+                    c.color = false;            // the depth part still counts
+                }
+            }
+        }
         CmdSW *cmd = swNewCmd();
         if (!cmd) return;
         cmd->type = SW_CMD_BLIT;
         cmd->tex  = tex;
         cmd->sx0 = sx0; cmd->sy0 = sy0; cmd->sw = sw; cmd->sh = sh;
         cmd->ox0 = ox0; cmd->oy0 = oy0; cmd->ow = ow; cmd->oh = oh;
+
+        static Texture *lastTex = NULL;
+        static uint32   lastVersion = 0, lastKey = 0, nextKey = 1;
+        static int      lastP[8];
+        const int p[8] = { sx0, sy0, sw, sh, ox0, oy0, ow, oh };
+        const uint32 version = (tex && tex->memory) ? tex->version : 0;
+        if (!lastKey || tex != lastTex || version != lastVersion || memcmp(p, lastP, sizeof(p))) {
+            lastKey     = nextKey++;
+            lastTex     = tex;
+            lastVersion = version;
+            memcpy(lastP, p, sizeof(p));
+        }
+        cmd->blitKey = lastKey;
     }
 
     void swBeginBatch(bool ortho, int maxTris) {
@@ -1060,7 +1209,14 @@ namespace GAPI {
 
         swBatch = &f.cmds[f.cmdCount++];
         swBatch->type     = SW_CMD_TRIS;
-        swBatch->texels   = curTile ? curTile->index : NULL;
+        const Tile8 *tt = curTile;
+        bool tiled = false;
+        if (tt && swTiled.tiled && tt >= swTiled.orig && tt < swTiled.orig + swTiled.count) {
+            tt    = swTiled.tiled + (tt - swTiled.orig);
+            tiled = true;
+        }
+        swBatch->texels   = tt ? tt->index : NULL;
+        swBatch->tiled    = tiled;
         swBatch->tex      = Core::active.textures[0];
         swBatch->affine   = (curTile == (Tile8*)swGradient);
         swBatch->ortho    = ortho;
@@ -1108,16 +1264,35 @@ namespace GAPI {
     }
 
     // ---- replay (both cores) ----
+    static void swBlitRow(const RasterCtxSW &ctx, const CmdSW &cmd, Texture *tex, int y, ColorSW *row);
+
     static void swExecBlit(const RasterCtxSW &ctx, const CmdSW &cmd) {
         Texture *tex = cmd.tex;
         const int W = Core::width, H = Core::height;
+        ColorSW *cacheEnd = swBlitCache ? swBlitCache + W * H - 1 : NULL;
         for (int y = 0; y < H; y++) {
             if (!ownsRowSW(ctx, y)) continue;
             ColorSW *row = ctx.colorEnd - y * W;
+            // the row as drawn the last time, if it is the same image
+            if (cacheEnd && swBlitRowKey[y] == cmd.blitKey) {
+                memcpy(row - (W - 1), cacheEnd - y * W - (W - 1), W * sizeof(ColorSW));
+                continue;
+            }
+            swBlitRow(ctx, cmd, tex, y, row);
+            if (cacheEnd) {
+                memcpy(cacheEnd - y * W - (W - 1), row - (W - 1), W * sizeof(ColorSW));
+                swBlitRowKey[y] = cmd.blitKey;
+            }
+        }
+    }
+
+    static void swBlitRow(const RasterCtxSW &ctx, const CmdSW &cmd, Texture *tex, int y, ColorSW *row) {
+        const int W = Core::width;
+        {
             const int iy = y - cmd.oy0;
             if (!tex || !tex->memory || iy < 0 || iy >= cmd.oh) {
                 memset(row - (W - 1), 0, W * sizeof(ColorSW));
-                continue;
+                return;
             }
             const uint8 *src = tex->memory + (size_t)(cmd.sy0 + iy * cmd.sh / cmd.oh) * tex->width * 4;
             if (cmd.ox0 > 0) memset(row - (cmd.ox0 - 1), 0, cmd.ox0 * sizeof(ColorSW));
@@ -1154,6 +1329,7 @@ namespace GAPI {
                 ctx.texels = cmd.texels;
                 ctx.tex    = cmd.tex;
                 ctx.affine = cmd.affine;
+                ctx.tiled  = cmd.tiled;
                 ctx.ortho  = cmd.ortho;
                 ctx.testZ  = cmd.testZ;
                 ctx.writeZ = cmd.writeZ;
@@ -1334,6 +1510,9 @@ namespace GAPI {
                 swBuffers[i] = new ColorSW[W * H];
                 memset(swBuffers[i], 0, W * H * sizeof(ColorSW));
             }
+            swBlitCache  = new ColorSW[W * H];
+            swBlitRowKey = new uint32[H];
+            memset(swBlitRowKey, 0, H * sizeof(uint32));
         }
         f.buffer   = swBuffers[swNextBuffer];
         f.colorEnd = f.buffer + W * H - 1;
