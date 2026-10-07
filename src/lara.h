@@ -509,6 +509,7 @@ struct Lara : Character {
         camera = new Camera(game, this);
 
         braid[0] = braid[1] = NULL;
+        zipline  = NULL;
 
         itemHolster  = TR::Entity::NONE;
         hitTimer     = 0.0f;
@@ -2372,8 +2373,46 @@ struct Lara : Character {
         specular = LARA_WET_SPECULAR;
     }
 
+    // ---- TR2 zipline ("death slide") --------------------------------------------
+    enum { ANIM_ZIPLINE_GRAB = 215, ANIM_ZIPLINE_FALL = 217 };
+
+    Controller *zipline;    // the handle she hangs from, or NULL
+
+    // grabs a zipline handle in reach (stopped, facing it, Action, hands free)
+    void ziplineCheck() {
+        if (zipline || (level->version & TR::VER_VERSION) <= TR::VER_TR1) return;
+        if (state != STATE_STOP || stand != STAND_GROUND || !(input & ACTION)) return;
+        for (int i = 0; i < level->entitiesCount; i++) {
+            const TR::Entity &e = level->entities[i];
+            if (e.type != TR::Entity::ZIPLINE_HANDLE || !e.controller) continue;
+            Controller *c = (Controller*)e.controller;
+            if (c->flags.state == TR::Entity::asActive) continue;    // already running
+            if (!checkInteraction(c, &TR::Limits::ZIPLINE, true)) continue;
+            animation.setAnim(ANIM_ZIPLINE_GRAB);
+            animation.setState(STATE_DEATH_SLIDE);
+            zipline = c;
+            c->activate();                                          // the handle starts
+            return;
+        }
+    }
+
+    // lets go of the handle: falls on, with its speed (the original's M_LetGo)
+    void ziplineLetGo(float speedXZ, float speedY, float angleY) {
+        zipline = NULL;
+        animation.setAnim(ANIM_ZIPLINE_FALL);
+        stand    = STAND_AIR;
+        angle.y  = angleY;
+        velocity = vec3(sinf(angleY) * speedXZ, speedY, cosf(angleY) * speedXZ);
+    }
+
     virtual Stand getStand() {
         if (dozy) return STAND_UNDERWATER;
+
+        if (zipline) return STAND_HANG;                 // carried by the handle
+        if (state == STATE_DEATH_SLIDE) {               // a ride left unfinished (loaded game)
+            animation.setAnim(ANIM_ZIPLINE_FALL);
+            return STAND_AIR;
+        }
 
         updateClimbStatus();
         if (isClimbState(state)) {
@@ -3220,6 +3259,8 @@ struct Lara : Character {
     }
 
     virtual int getStateHang() {
+        if (zipline)
+            return STATE_DEATH_SLIDE;
         if (isClimbState(state))
             return getStateClimb();
 
@@ -3782,6 +3823,7 @@ struct Lara : Character {
     }
 
     virtual void update() {
+        ziplineCheck();
         if (Input::state[camera->cameraIndex][cLook] && Input::lastState[camera->cameraIndex] == cAction)
             camera->changeView(!camera->firstPerson);
 
@@ -3916,6 +3958,11 @@ struct Lara : Character {
     virtual void updateVelocity() {
         flowVelocity = vec3(0);
 
+        if (zipline) {                                  // the handle moves her
+            velocity = vec3(0.0f);
+            return;
+        }
+
         if (!(input & DEATH) && !level->isCutsceneLevel())
             checkTrigger(this, false);
 
@@ -4043,6 +4090,11 @@ struct Lara : Character {
     virtual void updatePosition() { // TODO: sphere / bbox collision
         if (level->isCutsceneLevel())
             return;
+
+        if (zipline) {                                  // position set by the handle
+            updateRoom();
+            return;
+        }
 
         if (pickupAlignT < 1.0f) {
             if (state != STATE_PICK_UP && pickupAlignT > 0.0f) {
@@ -4434,6 +4486,101 @@ struct Lara : Character {
 
             if (dtex) dtex->bind(sDiffuse);
         }
+    }
+};
+
+// ---- TR2 zipline handle ("death slide"): the original's control ------------------
+#define ZIPLINE_MAX_SPEED     100
+#define ZIPLINE_ACCELERATION  5
+#define SND_TR2_ZIPLINE_GO    280
+#define SND_TR2_ZIPLINE_STOP  281
+
+struct ZiplineHandle : Controller {
+    enum {
+        STATE_GRAB = 1,
+        STATE_HANG = 2,
+    };
+
+    vec3  startPos;
+    int16 startRoom;
+    bool  spent;            // a ride under way (a trigger with it unspent sends it back)
+    float fallSpeed;        // the original's speed, per 30 Hz tick
+    float tick;
+
+    ZiplineHandle(IGame *game, int entity) : Controller(game, entity), startPos(pos), startRoom(roomIndex), spent(false), fallSpeed(0.0f), tick(0.0f) {}
+
+    Lara* rider() {
+        Lara *lara = (Lara*)game->getLara(pos);
+        return (lara && lara->zipline == this) ? lara : NULL;
+    }
+
+    void letGo(Lara *lara) {
+        lara->ziplineLetGo(fallSpeed, float(int(fallSpeed) >> 2), angle.y);
+    }
+
+    virtual void update() {
+        if (!spent) {
+            if (rider()) {                  // Lara just grabbed it
+                spent     = true;
+                fallSpeed = 0.0f;
+                tick      = 0.0f;
+            } else {                        // back to the start (a trigger after a ride)
+                pos       = startPos;
+                roomIndex = startRoom;
+                animation.setAnim(0);
+                deactivate();
+                return;
+            }
+        }
+
+        if (state == STATE_GRAB)
+            animation.setState(STATE_HANG);     // the grab plays on into the ride
+        updateAnimation(true);
+        if (state == STATE_GRAB)
+            return;
+
+        tick += Core::deltaTime;
+        while (tick >= 1.0f / 30.0f) {
+            tick -= 1.0f / 30.0f;
+            if (!step()) return;
+        }
+    }
+
+    // one tick of the original's control
+    bool step() {
+        if (fallSpeed < ZIPLINE_MAX_SPEED)
+            fallSpeed += ZIPLINE_ACCELERATION;
+
+        pos.y += float(int(fallSpeed) >> 2);
+        pos   += getDir() * fallSpeed;
+        int16 r = roomIndex;
+        level->getSector(r, pos);
+        roomIndex = r;
+
+        Lara *lara = rider();
+        if (lara) {
+            lara->pos = pos;
+            if (!(lara->input & Character::ACTION))
+                letGo(lara);
+        }
+
+        // keeps going while the way ahead is open (a block on, a quarter step down)
+        vec3 p = pos + vec3(0.0f, 64.0f, 0.0f) + getDir() * 1024.0f;
+        int16 pr = roomIndex;
+        TR::Room::Sector *sector = level->getSector(pr, p);
+        if (sector && level->getFloor(sector, p) > p.y + 256.0f && level->getCeiling(sector, p) < p.y - 256.0f) {
+            game->playSound(SND_TR2_ZIPLINE_GO, pos, Sound::PAN | Sound::UNIQUE);
+            return true;
+        }
+
+        lara = rider();
+        if (lara)
+            letGo(lara);
+        Sound::stop(SND_TR2_ZIPLINE_GO);
+        game->playSound(SND_TR2_ZIPLINE_STOP, pos, Sound::PAN);
+        spent = false;
+        deactivate();
+        return false;
     }
 };
 

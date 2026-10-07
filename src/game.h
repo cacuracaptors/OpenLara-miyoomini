@@ -118,6 +118,12 @@ void loadSettings(Stream *stream, void *userData) {
         Core::settings.detail.water    = Core::Settings::LOW;
     #endif
 
+    #ifdef __MIYOO__
+        // no reverberation on the Miyoo: an OpenLara addition (the original
+        // game has none) that cost ~5% of a core all the time, even in silence
+        Core::settings.audio.reverb = false;
+    #endif
+
     shaderCache = new ShaderCache();
     Game::startLevel((Stream*)userData);
 }

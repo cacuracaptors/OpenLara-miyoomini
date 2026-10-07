@@ -170,7 +170,9 @@ static const OptionItem optSound[] = {
     OptionItem( ),
     OptionItem( OptionItem::TYPE_PARAM,  STR_EMPTY,         SETTINGS( audio.music     ), 0xFF0080FF, 101, SND_MAX_VOLUME, true ),
     OptionItem( OptionItem::TYPE_PARAM,  STR_EMPTY,         SETTINGS( audio.sound     ), 0xFFFF8000, 102, SND_MAX_VOLUME, true ),
+#ifndef __MIYOO__   // always off on the Miyoo (see game.h)
     OptionItem( OptionItem::TYPE_PARAM,  STR_REVERBERATION, SETTINGS( audio.reverb    ), STR_OFF, 0, 1 ),
+#endif
     OptionItem( OptionItem::TYPE_PARAM,  STR_OPT_SUBTITLES, SETTINGS( audio.subtitles ), STR_OFF, 0, 1 ),
 #ifndef FFP
     OptionItem( OptionItem::TYPE_PARAM,  STR_OPT_LANGUAGE,  SETTINGS( audio.language  ), STR_LANG_EN, 0, STR_LANG_KO - STR_LANG_EN ), 
@@ -1477,6 +1479,10 @@ struct Inventory {
             return;
         #endif
 
+        #ifdef _GAPI_SW
+            return;     // no render targets: the menu keeps a copy of the game picture instead (swMenuBg)
+        #endif
+
         if (Core::settings.detail.stereo == Core::Settings::STEREO_VR)
             return;
 
@@ -1787,6 +1793,8 @@ struct Inventory {
             int outY0 = (Core::height - outH) / 2;
 
             GAPI::swRecordBlit(tex, srcX0, srcY0, srcW, srcH, outX0, outY0, outW, outH);
+        } else if (GAPI::swMenuBgAvailable()) {
+            GAPI::swRecordRestore();    // in-game menu: the game picture kept when it opened
         }
         return;
     #endif
@@ -1910,6 +1918,13 @@ struct Inventory {
     }
 
     void renderGameBG(int view) {
+    #ifdef _GAPI_SW
+        // the game picture kept when the menu opened (darkened): this backend
+        // cannot draw the GPU's background texture below
+        if (GAPI::swMenuBgAvailable())
+            GAPI::swRecordRestore();
+        return;
+    #endif
         Index  indices[6] = { 0, 1, 2, 0, 2, 3 };
         Vertex vertices[4];
         vertices[0].coord = short4(-32767,  32767, 0, 1);

@@ -4,6 +4,7 @@
 #include <sched.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <algorithm>
 #ifndef H_GAPI_SW
 #define H_GAPI_SW
 
@@ -247,6 +248,7 @@ namespace GAPI {
     bool    swShadowBatch = false; // drawing a shadow blob: darken what is below
     bool    swModelInUI   = false; // a 3D model drawn without perspective (picked-up item): not 2D UI
     bool    swBatchWater = false;  // this batch: camera underwater, or geometry in a water room
+    bool    swSkyBatch   = false;  // this batch: the TR2 sky (drawn last, only where nothing is)
     float   swWaterTime  = 0.0f;   // seconds, set by the level each frame
     // 2D primitive whose UVs all point at one texel (the white sprite used
     // by frames, backgrounds and bars): fill it with its colour directly.
@@ -672,7 +674,7 @@ namespace GAPI {
     #define SW_BAND_SHIFT 3
     #define SW_GROUPS     64
 
-    enum { SW_CMD_CLEAR, SW_CMD_TRIS, SW_CMD_BLIT };
+    enum { SW_CMD_CLEAR, SW_CMD_TRIS, SW_CMD_BLIT, SW_CMD_SNAPSHOT, SW_CMD_RESTORE };
 
     struct CmdSW {
         int          type;
@@ -683,6 +685,7 @@ namespace GAPI {
         bool         tiled;                                // triangles: texels in 8x8 blocks
         uint32       blitKey;                              // blit: which image (for the cache)
         bool         water;                                // triangles: use the underwater palette
+        bool         sky;                                  // triangles: the sky, at "infinite" depth
         bool         shadow;                               // triangles: darken instead of texturing
         short4       clip;
         int          triStart, triCount;
@@ -703,6 +706,7 @@ namespace GAPI {
         VertexSW *verts;
         int       cmdCount, triCount, vertCount;
         bool      overflow;
+        bool      snapshot;              // keeps the menu background (SW_CMD_SNAPSHOT)
         ColorSW  *buffer;
         ColorSW  *colorEnd;
         uint8     owner[SW_GROUPS];      // 1: the worker core draws this group
@@ -717,6 +721,19 @@ namespace GAPI {
     FrameSW *swPend = NULL;   // recorded, being rasterized
     ColorSW *swBuffers[2] = { NULL, NULL };
     int      swNextBuffer = 0;
+
+    // Drawing straight into the screen's 3 pages (set by the platform when its
+    // memory takes the painter's writes as fast as normal memory): frames take
+    // them in turn - one on screen, one waiting for the vsync, one being drawn -
+    // and no copy of the finished frame is needed.
+    ColorSW *swScreenPages[3] = { NULL, NULL, NULL };
+
+    void swUseScreenPages(ColorSW *a, ColorSW *b, ColorSW *c, int first) {
+        swScreenPages[0] = a;
+        swScreenPages[1] = b;
+        swScreenPages[2] = c;
+        swNextBuffer     = first % 3;
+    }
     void   (*swPresent)(const ColorSW *buffer) = NULL;   // set by the platform
     int      swWorkerGroups = 36;
     long long swLaunchTime  = 0;   // when the worker got the pending frame
@@ -761,6 +778,11 @@ namespace GAPI {
         return (d + ((d >> 31) & 15)) >> 4;
     }
 
+    // the same for 32 (the long stretches of the adaptive perspective)
+    static inline int32 div32SW(int32 d) {
+        return (d + ((d >> 31) & 31)) >> 5;
+    }
+
     void swRegisterTiles(const Tile8 *tiles, int count) {
         swDrain();
         delete[] swTiled.tiled;
@@ -795,6 +817,7 @@ namespace GAPI {
         bool           affine, ortho, testZ, writeZ;
         bool           tiled;
         bool           shadow;
+        bool           sky;
         short4         clip;
         int            band;     // 0: main core, 1: worker core
         long long      pixels;
@@ -947,6 +970,7 @@ namespace GAPI {
         const bool     writeZ   = depth && ctx.writeZ;
         const bool     affine   = ctx.affine;
         const bool     tiled    = ctx.tiled && !affine;
+        const bool     sky      = ctx.sky;
         const uint8   *lightSel = ctx.frame->lightSel;
         const ColorSW *palWorld = ctx.pal;
         const int32    UV_MAX   = (256 << 16) - 1;
@@ -972,15 +996,65 @@ namespace GAPI {
         zA = int32(pq * 536870912.0f);
         if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
 
+        bool needA = false;     // the start of the stretch to work out again (after a skip)
+
         int x = x0;
         while (x < x1) {
             int len = x1 - x;
-            if (len > SW_PERSP_SPAN) len = SW_PERSP_SPAN;
+            if (len > SW_PERSP_SPAN) {
+                len = SW_PERSP_SPAN;
+                // 1/w barely changes over 32 pixels (far, or facing the camera):
+                // one perspective step for all 32 gives the same texture
+                if (x1 - x >= 32 && !affine && fabsf(pQ.dx) * 32.0f < pq * (1.0f / 64.0f))
+                    len = 32;
+            }
 
             float pu1 = pu + pU.dx * float(len);
             float pv1 = pv + pV.dx * float(len);
             float pq1 = pq + pQ.dx * float(len);
             float l1  = l  + pL.dx * float(len);
+
+            // the whole stretch behind what is already drawn: skipped at once,
+            // without its perspective step (none of its pixels would pass the
+            // depth test: 1/w is linear, so its nearest point is an end)
+            if (testZ) {
+                int32 cn = 0;                       // the sky: "infinitely" far
+                if (!sky) {
+                    float qn = pq > pq1 ? pq : pq1;
+                    int32 zn = int32(qn * 536870912.0f);
+                    if (zn < 0) zn = 0; else if (zn > Z_MAX) zn = Z_MAX;
+                    cn = depthCodeSW(zn);
+                }
+                const DepthSW *d = depth + x;
+                int k = 0;
+                while (k < len && int32(d[k]) > cn) k++;
+                if (k == len) {
+                    x  += len;
+                    pu  = pu1;
+                    pv  = pv1;
+                    pq  = pq1;
+                    l   = l1;
+                    needA = true;
+                    continue;
+                }
+            }
+            if (needA) {                            // after a skip: this stretch's start
+                invA = 1.0f / (pq < 1e-6f ? 1e-6f : pq);
+                if (affine) {
+                    ua = int32(pu);
+                    va = int32(pv);
+                } else {
+                    ua = int32(pu * invA);
+                    va = int32(pv * invA);
+                }
+                if (ua < 0) ua = 0; else if (ua > UV_MAX) ua = UV_MAX;
+                if (va < 0) va = 0; else if (va > UV_MAX) va = UV_MAX;
+                lvA = int32(l);
+                if (lvA < 0) lvA = 0; else if (lvA > LV_MAX) lvA = LV_MAX;
+                zA = int32(pq * 536870912.0f);
+                if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
+                needA = false;
+            }
 
             int32 ub, vb;
             if (affine) {
@@ -1003,7 +1077,7 @@ namespace GAPI {
             int32 du, dv, dl, dz;
             // depth: codes at both ends of the stretch; with the same exponent at
             // both, the code follows 1/w linearly and is just stepped
-            const int32 zcA = depthCodeSW(zA) << 8, zcB = depthCodeSW(zB) << 8;
+            const int32 zcA = sky ? 0 : (depthCodeSW(zA) << 8), zcB = sky ? 0 : (depthCodeSW(zB) << 8);   // the sky: "infinitely" far
             const bool  zcode = (zcA >> 20) != (zcB >> 20);   // crosses an exponent
             const int32 zS = zcode ? zA : zcA, zE = zcode ? zB : zcB;
             if (len == 16) {
@@ -1011,6 +1085,11 @@ namespace GAPI {
                 dv = div16SW(vb - va);
                 dl = div16SW(lvB - lvA);
                 dz = div16SW(zE - zS);
+            } else if (len == 32) {
+                du = div32SW(ub - ua);
+                dv = div32SW(vb - va);
+                dl = div32SW(lvB - lvA);
+                dz = div32SW(zE - zS);
             } else {
                 du = (ub - ua) / len;
                 dv = (vb - va) / len;
@@ -1145,6 +1224,31 @@ namespace GAPI {
         return &f.cmds[f.cmdCount++];
     }
 
+    // The in-game menu's background: the software renderer has no render
+    // targets, so the game picture (without the HUD) is copied aside when the
+    // menu opens and copied back under the ring each frame, instead of drawing
+    // the whole level behind it again (the game is paused meanwhile).
+    ColorSW *swMenuBg      = NULL;
+    bool     swMenuBgReady = false;
+
+    void swRecordSnapshot() {
+        CmdSW *cmd = swNewCmd();
+        if (!cmd) return;
+        cmd->type = SW_CMD_SNAPSHOT;
+        swRec->snapshot = true;
+    }
+
+    // the kept picture can be put back: ready, or kept earlier in this frame
+    bool swMenuBgAvailable() {
+        return swMenuBgReady || (swRec && swRec->snapshot);
+    }
+
+    void swRecordRestore() {
+        CmdSW *cmd = swNewCmd();
+        if (!cmd) return;
+        cmd->type = SW_CMD_RESTORE;
+    }
+
     void swRecordClear(bool color, bool depth) {
         CmdSW *cmd = swNewCmd();
         if (!cmd) return;
@@ -1224,13 +1328,41 @@ namespace GAPI {
         swBatch->writeZ   = swDepthWrite;
         swBatch->water    = swBatchWater;
         swBatch->shadow   = swShadowBatch;
+        swBatch->sky      = swSkyBatch;
         swBatch->clip     = swClipRect;
         swBatch->triStart = f.triCount;
         swBatch->triCount = 0;
     }
 
+    // Near faces first, in opaque batches: the depth test then throws away what
+    // lies behind them instead of painting it and painting over it. A stable
+    // sort by each face's nearest corner (ties keep the level's order).
+    struct TriKeySW {
+        float key;
+        TriSW tri;
+    };
+    static TriKeySW *swSortBuf = NULL;
+
+    static void swSortNearFirst(TriSW *tris, int n) {
+        if (!swSortBuf) swSortBuf = new TriKeySW[SW_MAX_TRIS];
+        for (int i = 0; i < n; i++) {
+            const TriSW &t = tris[i];
+            float k = t.a->pq;
+            if (t.b->pq > k) k = t.b->pq;
+            if (t.c->pq > k) k = t.c->pq;
+            swSortBuf[i].key = k;
+            swSortBuf[i].tri = t;
+        }
+        std::stable_sort(swSortBuf, swSortBuf + n, [](const TriKeySW &a, const TriKeySW &b) { return a.key > b.key; });
+        for (int i = 0; i < n; i++)
+            tris[i] = swSortBuf[i].tri;
+    }
+
     void swEndBatch() {
-        if (swBatch) swBatch->triCount = swRec->triCount - swBatch->triStart;
+        if (!swBatch) return;
+        swBatch->triCount = swRec->triCount - swBatch->triStart;
+        if (swBatch->triCount > 1 && swBatch->testZ && swBatch->writeZ && !swBatch->ortho && !swBatch->shadow && !swBatch->sky && !swBatch->affine)
+            swSortNearFirst(swRec->tris + swBatch->triStart, swBatch->triCount);
     }
 
     static inline void swAddTri(Index ia, Index ib, Index ic) {
@@ -1323,6 +1455,26 @@ namespace GAPI {
                     if (cmd.color) memset(ctx.colorEnd - y * W - (W - 1), 0, W * sizeof(ColorSW));
                     if (cmd.depth && swDepth) memset(swDepth + y * W, 0, W * sizeof(DepthSW));
                 }
+            } else if (cmd.type == SW_CMD_SNAPSHOT || cmd.type == SW_CMD_RESTORE) {
+                ColorSW *bgEnd = swMenuBg + W * H - 1;
+                for (int y = 0; y < H; y++) {
+                    if (!ownsRowSW(ctx, y)) continue;
+                    ColorSW *row = ctx.colorEnd - y * W - (W - 1);
+                    ColorSW *bg  = bgEnd - y * W - (W - 1);
+                    if (cmd.type == SW_CMD_SNAPSHOT) {
+                        memcpy(bg, row, W * sizeof(ColorSW));
+                        // darkened by half, as the original's menu background
+                        for (int i = 0; i < W; i++) {
+                        #ifdef COLOR_16
+                            bg[i] = ColorSW((bg[i] >> 1) & 0x7BEF);
+                        #else
+                            bg[i] = ColorSW((bg[i] >> 1) & 0x7F7F7F7F);
+                        #endif
+                        }
+                    } else {
+                        memcpy(row, bg, W * sizeof(ColorSW));
+                    }
+                }
             } else if (cmd.type == SW_CMD_BLIT) {
                 swExecBlit(ctx, cmd);
             } else {
@@ -1336,6 +1488,7 @@ namespace GAPI {
                 ctx.clip   = cmd.clip;
                 ctx.pal    = cmd.water ? f.palWater : f.palWorld;
                 ctx.shadow = cmd.shadow;
+                ctx.sky    = cmd.sky;
                 const TriSW *tri = f.tris + cmd.triStart;
                 for (int k = 0; k < cmd.triCount; k++, tri++) {
                     rasterTriangleSW(ctx, tri->a, tri->b, tri->c);
@@ -1422,6 +1575,7 @@ namespace GAPI {
             swWorker.seq = swWorker.done = 0;
             swWorker.started = true;
             pthread_create(&swWorker.thread, NULL, swWorkerProc, NULL);
+            pthread_setname_np(swWorker.thread, "sw-worker");
 
             // pin the two threads to different cores (the scheduler kept both on core 0)
             cpu_set_t set;
@@ -1484,6 +1638,11 @@ namespace GAPI {
         swPerfPixels += px;
         swPerfRaster += t2 - t0;
 
+        if (f.snapshot) {                     // the menu background is in place
+            swMenuBgReady = true;
+            f.snapshot    = false;
+        }
+
         if (swPresent) swPresent(f.buffer);   // waits for the other buffer's copy, then starts this one
 
         f.cmdCount = f.triCount = f.vertCount = 0;
@@ -1505,18 +1664,26 @@ namespace GAPI {
         if (f.cmdCount == 0) return;
 
         const int W = Core::width, H = Core::height;
-        if (!swBuffers[0]) {
-            for (int i = 0; i < 2; i++) {
-                swBuffers[i] = new ColorSW[W * H];
-                memset(swBuffers[i], 0, W * H * sizeof(ColorSW));
-            }
+        if (!swBlitCache) {
             swBlitCache  = new ColorSW[W * H];
+            swMenuBg     = new ColorSW[W * H];
             swBlitRowKey = new uint32[H];
             memset(swBlitRowKey, 0, H * sizeof(uint32));
         }
-        f.buffer   = swBuffers[swNextBuffer];
+        if (swScreenPages[0]) {                 // straight into the screen pages, in turn
+            f.buffer     = swScreenPages[swNextBuffer];
+            swNextBuffer = (swNextBuffer + 1) % 3;
+        } else {
+            if (!swBuffers[0]) {
+                for (int i = 0; i < 2; i++) {
+                    swBuffers[i] = new ColorSW[W * H];
+                    memset(swBuffers[i], 0, W * H * sizeof(ColorSW));
+                }
+            }
+            f.buffer     = swBuffers[swNextBuffer & 1];
+            swNextBuffer = (swNextBuffer + 1) & 1;
+        }
         f.colorEnd = f.buffer + W * H - 1;
-        swNextBuffer ^= 1;
 
         swBuildShadeFrame(f);
         swBuildOwner(f, swWorkerGroups);
@@ -1771,7 +1938,10 @@ namespace GAPI {
                 // TR3 lights vertices in colour; use the luminance (identical
                 // to the old red-channel read for TR1/TR2's grey light)
                 lit.l = (((vertex.light.x * 77 + vertex.light.y * 150 + vertex.light.z * 29) >> 8) * ambient) >> 8;
-                applyLighting(lit, vertex, cv.c.w);
+                if (swSkyBatch)
+                    lit.l = 0;      // the sky: its own colours, no room light, lamps or fog (as the original)
+                else
+                    applyLighting(lit, vertex, cv.c.w);
                 cv.l = lit.l;
                 if (waterFx) {
                     cv.l += int32(sinf(waterPhase * 2.1f + swWaterTime) * 22.0f * 65536.0f);
@@ -1783,7 +1953,7 @@ namespace GAPI {
                            (uint32(vertex.light.z) << 16) | (uint32(vertex.light.w) << 24);
 
                 }
-                if (cv.c.w > SW_MAX_DIST) tooFar = true;
+                if (cv.c.w > SW_MAX_DIST && !swSkyBatch) tooFar = true;   // the sky is always far: never cut
                 // Orthographic (2D) geometry has w == 1 exactly: it is never
                 // behind the camera and must not be near-clipped.
                 const bool isOrtho = (cv.c.w == 1.0f);

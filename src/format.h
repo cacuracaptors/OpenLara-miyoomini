@@ -1602,6 +1602,10 @@ namespace TR {
             0, -612, 30,    ::Box(vec3(-300, 0, -692), vec3(300, 0, -512)), true, false
         };
 
+        Limit ZIPLINE = {   // TR2 zipline handle: the original's bounds (x +-256, y +-100, z 256..512, +-25 deg) and grab spot (z 371)
+            0, 371, 25,     ::Box(vec3(-256, -100, 256), vec3(256, 100, 512)), true, true
+        };
+
         Limit MIDAS = { 
             512, -612, 30,  ::Box(vec3(-700, 284, -700), vec3(700, 996, 700)), true, false
         };

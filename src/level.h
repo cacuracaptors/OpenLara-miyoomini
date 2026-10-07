@@ -55,6 +55,19 @@ struct Level : IGame {
     AmbientCache *ambientCache;
     WaterCache   *waterCache;
 
+    // The GPU water (a mirrored second render of the whole scene for the
+    // reflection, wave simulation, mask, refraction, light rays) cannot be
+    // shown by the software renderer, which draws water its own way (the
+    // water palette, the sway and the shimmer, as the DOS game). It was all
+    // done - and thrown away - every frame with water on screen.
+    static bool swNoWaterCache() {
+    #ifdef _GAPI_SW
+        return true;
+    #else
+        return false;
+    #endif
+    }
+
     Sound::Sample *sndTrack, *sndWater;
     bool waitTrack;
 
@@ -426,7 +439,7 @@ struct Level : IGame {
             
         if (rebuildWater) {
             delete waterCache;
-            waterCache = Core::settings.detail.water > Core::Settings::LOW ? new WaterCache(this) : NULL;
+            waterCache = (Core::settings.detail.water > Core::Settings::LOW && !swNoWaterCache()) ? new WaterCache(this) : NULL;
         }
 
         if (redraw && inventory->active && !level.isTitle())
@@ -1015,7 +1028,7 @@ struct Level : IGame {
 
             zoneCache    = new ZoneCache(this);
             ambientCache = Core::settings.detail.lighting > Core::Settings::MEDIUM ? new AmbientCache(this) : NULL;
-            waterCache   = Core::settings.detail.water    > Core::Settings::LOW    ? new WaterCache(this)   : NULL;
+            waterCache   = (Core::settings.detail.water > Core::Settings::LOW && !swNoWaterCache()) ? new WaterCache(this) : NULL;
 
             if (ambientCache) { // at first calculate ambient cube for Lara
                 AmbientCache::Cube cube;
@@ -1334,6 +1347,7 @@ struct Level : IGame {
             case TR::Entity::TRAP_BLADE_WALL        : return new TrapBladeWall(this, index);
             case TR::Entity::TRAP_SPINDLE           : return new TrapSpinningBlade(this, index);
             case TR::Entity::TRAP_SPIKES_WALL       : return new TrapSpikeWall(this, index);
+            case TR::Entity::ZIPLINE_HANDLE         : return new ZiplineHandle(this, index);
 
             case TR::Entity::CRYSTAL_PICKUP         : return new CrystalPickup(this, index);
             case TR::Entity::STONE_ITEM_1           :
@@ -1911,7 +1925,11 @@ struct Level : IGame {
 
     void renderSky() {
         #if !defined(_GAPI_GL) && !defined(_GAPI_D3D11)
-            return;
+            #if defined(_GAPI_SW)
+                if (level.version & TR::VER_TR1) return;    // TR1's sky is a shader effect
+            #else
+                return;
+            #endif
         #endif
         ASSERT(mesh->transparent == 0);
 
@@ -1974,7 +1992,20 @@ struct Level : IGame {
         } else {
             Basis b;
             Core::setBasis(&b, 1); // unused
+            #ifdef _GAPI_SW
+                // after the opaque geometry, at "infinite" depth and without
+                // writing it: it fills only where nothing was drawn - the same
+                // picture as drawing it first, without painting it under walls
+                Core::setDepthTest(true);
+                Core::setDepthWrite(false);
+                GAPI::swSkyBatch = true;
+            #endif
             mesh->renderModel(level.extra.sky);
+            #ifdef _GAPI_SW
+                GAPI::swSkyBatch = false;
+                Core::setDepthTest(true);
+                Core::setDepthWrite(true);
+            #endif
         }
 
         Core::setViewProj(mView, mProj);
@@ -2582,6 +2613,13 @@ struct Level : IGame {
         if (zClip == 4)
             return false;
 
+    #ifdef _GAPI_SW
+        // the whole portal past the drawing distance (fully fogged there, as the
+        // original): all that is behind it is even farther and never drawn
+        if (p[0].w > SW_MAX_DIST && p[1].w > SW_MAX_DIST && p[2].w > SW_MAX_DIST && p[3].w > SW_MAX_DIST)
+            return false;
+    #endif
+
         if (zClip > 0) {
             for (int i = 0; i < 4; i++) {
                 vec4 &a = p[i];
@@ -2624,6 +2662,10 @@ struct Level : IGame {
         return true;
     }
 
+    static inline float rectAreaSW(const vec4 &r) {
+        return max(0.0f, r.z - r.x) * max(0.0f, r.w - r.y);
+    }
+
     virtual void getVisibleRooms(RoomDesc *roomsList, int &roomsCount, int from, int to, const vec4 &viewPort, bool water, int count = 0) {
         if (roomsCount >= 255 || count > 16) {
             //ASSERT(false);
@@ -2636,6 +2678,19 @@ struct Level : IGame {
             waterCache->setVisible(from, to);
 
         room.flags.visible = true;
+    #ifdef _GAPI_SW
+        // as the original: a room seen through several portals is drawn once,
+        // over the union of their rectangles (each extra copy meant preparing
+        // and setting up the whole room again; merging only some of them was
+        // measured slower)
+        int best = -1;
+        for (int k = 0; k < roomsCount; k++)
+            if (roomsList[k].index == to) { best = k; break; }
+        if (best >= 0) {
+            vec4 &r = roomsList[best].portal;
+            r = vec4(min(r.x, viewPort.x), min(r.y, viewPort.y), max(r.z, viewPort.z), max(r.w, viewPort.w));
+        } else
+    #endif
         roomsList[roomsCount++] = RoomDesc(to, viewPort);
 
         vec4 clipPort;
@@ -2653,6 +2708,7 @@ struct Level : IGame {
     void renderOpaque(RoomDesc *roomsList, int roomsCount) {
         renderRooms(roomsList, roomsCount, 0);
         renderEntities(0);
+        // (software: the sky goes only where nothing opaque was drawn, see renderSky)
         if (Core::pass != Core::passShadow && skyIsVisible) {
             renderSky();
         }
@@ -2761,6 +2817,34 @@ struct Level : IGame {
         GAPI::swWaterTime  = float(osGetTimeMS() % 1000000) * 0.001f;
         GAPI::swShadeDirty = true;
     #endif
+    #ifdef _GAPI_SW
+        // near rooms first: the depth test then throws away what lies behind
+        // them before it is painted (the portal search could list a far room
+        // before a near one, which then painted over it)
+        {
+            const vec3 eye = Core::viewPos.xyz();
+            float dist[256];
+            for (int i = 0; i < roomsCount; i++) {
+                const TR::Room &r = level.rooms[roomsList[i].index];
+                float dx = max(0.0f, max(float(r.info.x) - eye.x, eye.x - float(r.info.x + r.xSectors * 1024)));
+                float dz = max(0.0f, max(float(r.info.z) - eye.z, eye.z - float(r.info.z + r.zSectors * 1024)));
+                float dy = max(0.0f, max(float(r.info.yTop) - eye.y, eye.y - float(r.info.yBottom)));
+                dist[i] = dx * dx + dy * dy + dz * dz;
+            }
+            for (int i = 1; i < roomsCount; i++) {      // stable insertion sort
+                RoomDesc d = roomsList[i];
+                float    k = dist[i];
+                int      j = i - 1;
+                while (j >= 0 && dist[j] > k) {
+                    roomsList[j + 1] = roomsList[j];
+                    dist[j + 1]      = dist[j];
+                    j--;
+                }
+                roomsList[j + 1] = d;
+                dist[j + 1]      = k;
+            }
+        }
+    #endif
         prepareRooms(roomsList, roomsCount);
 
         renderOpaque(roomsList, roomsCount);
@@ -2801,6 +2885,12 @@ struct Level : IGame {
             Core::validateRenderState();
             waterCache->blitTexture(screen);
         }
+
+    #ifdef _GAPI_SW
+        // the menu's frozen background: the game picture, without the HUD
+        if (inventory->isActive() && !level.isTitle() && !inventory->video && Core::pass == Core::passCompose)
+            GAPI::swRecordSnapshot();
+    #endif
 
         if (showUI) {
             renderUI();
@@ -3300,6 +3390,13 @@ struct Level : IGame {
         #endif
 
         needRenderGame = !inventory->video && !level.isTitle() && ((inventory->phaseRing < 1.0f && inventory->titleTimer <= 1.0f) || needRedrawTitleBG);
+    #ifdef _GAPI_SW
+        // with the game picture kept aside, the level is not drawn behind the menu
+        if (!inventory->isActive())
+            GAPI::swMenuBgReady = false;
+        else if (GAPI::swMenuBgReady && !inventory->video && !level.isTitle())
+            needRenderGame = false;
+    #endif
         needRenderInventory = inventory->video || level.isTitle() || inventory->phaseRing > 0.0f || inventory->titleTimer > 0.0f;
 
         bool title  = inventory->isActive() || level.isTitle();

@@ -196,6 +196,7 @@ bool sndInit() {
 
     sndRunning = true;
     pthread_create(&sndThread, NULL, sndLoop, NULL);
+    pthread_setname_np(sndThread, "sound");
     fprintf(stderr, "sound: MI_AO opened at %d Hz stereo (mixer %d Hz)\n", SND_OUT_RATE, SND_RATE);
     return true;
 }
@@ -428,6 +429,7 @@ static fb_var_screeninfo fbVar;
 static uint8            *fbMem   = NULL;
 static int               fbPage  = 0;      // the page on screen
 static bool              fbVsync = false;
+static bool              fbDirect = false;  // drawing straight into the screen pages (no copy)
 
 // back to page 0, where OnionOS draws (on exit and on a crash)
 static void fbRestore() {
@@ -456,6 +458,35 @@ static void fbInit() {
     fallout::crashHook = fbRestore;
     atexit(fbRestore);
     fprintf(stderr, "vsync: on (2 framebuffer pages)\n");
+
+    // Drawing straight into the screen pages, if the screen memory takes the
+    // painter's writes (single pixels, walking down) about as fast as normal
+    // memory. Measured on the hidden third page; otherwise frames are copied.
+    if (fbVar.yres_virtual >= (unsigned)SCREEN_HEIGHT * 3 && fix.smem_len >= (unsigned)SCREEN_WIDTH * 4 * SCREEN_HEIGHT * 3) {
+        const int N = SCREEN_WIDTH * SCREEN_HEIGHT;
+        uint32 *ram = new uint32[N];
+        volatile uint32 *scr = (volatile uint32*)(fbMem + size_t(2) * N * 4);
+        long long t0 = GAPI::swPerfNow();
+        for (int r = 0; r < 4; r++) { volatile uint32 *p = (volatile uint32*)ram + N - 1; for (int i = 0; i < N; i++) *p-- = uint32(i); }
+        long long t1 = GAPI::swPerfNow();
+        for (int r = 0; r < 4; r++) { volatile uint32 *p = scr + N - 1; for (int i = 0; i < N; i++) *p-- = uint32(i); }
+        long long t2 = GAPI::swPerfNow();
+        uint32 sum = 0;
+        for (int i = 0; i < 65536; i++) sum += scr[i];
+        long long t3 = GAPI::swPerfNow();
+        for (int i = 0; i < 65536; i++) sum += ((volatile uint32*)ram)[i];
+        long long t4 = GAPI::swPerfNow();
+        delete[] ram;
+        fbDirect = (t2 - t1) * 10 <= (t1 - t0) * 13;
+        fprintf(stderr, "screen pages: writes %.2f ms (memory %.2f ms), reads %.2f ms (memory %.2f ms) -> %s [%u]\n",
+            (t2 - t1) / 1000.0, (t1 - t0) / 1000.0, (t3 - t2) / 1000.0, (t4 - t3) / 1000.0,
+            fbDirect ? "drawing straight into the screen" : "copying each frame", sum & 1);
+        if (fbDirect) {
+            const size_t page = size_t(N);
+            GAPI::ColorSW *base = (GAPI::ColorSW*)fbMem;
+            GAPI::swUseScreenPages(base, base + page, base + 2 * page, fbPage + 1);
+        }
+    }
 }
 
 // Copying the finished frame to the framebuffer (SDL_Flip) takes ~4 ms: the
@@ -480,12 +511,17 @@ static void* flipProc(void *arg) {
         // copy the finished (already rotated) frame into the screen
         const GAPI::ColorSW *src = flipSrc;
         if (fbVsync) {
-            // into the hidden page, then show it at the next vsync (waits for it)
-            const int back = fbPage ^ 1;
-            memcpy(fbMem + back * SCREEN_HEIGHT * SCREEN_WIDTH * 4, src, SCREEN_WIDTH * SCREEN_HEIGHT * 4);
-            fbVar.yoffset = back * SCREEN_HEIGHT;
-            ioctl(fbFd, FBIOPAN_DISPLAY, &fbVar);
-            fbPage = back;
+            const size_t pageBytes = size_t(SCREEN_HEIGHT) * SCREEN_WIDTH * 4;
+            int page;
+            if (fbDirect) {                     // already drawn in a screen page: just show it
+                page = int(((const uint8*)src - fbMem) / pageBytes);
+            } else {                            // into the hidden page
+                page = fbPage ^ 1;
+                memcpy(fbMem + page * pageBytes, src, pageBytes);
+            }
+            fbVar.yoffset = page * SCREEN_HEIGHT;
+            ioctl(fbFd, FBIOPAN_DISPLAY, &fbVar);   // shows it at the next vsync, and waits for it
+            fbPage = page;
         } else {
         if (SDL_MUSTLOCK(flipScreen)) SDL_LockSurface(flipScreen);
         if (flipScreen->pitch == SCREEN_WIDTH * 4) {
@@ -517,6 +553,7 @@ static void flipStart(const GAPI::ColorSW *buffer) {
     flipWait();   // one copy at a time
     if (!flipStarted) {
         pthread_create(&flipThread, NULL, flipProc, NULL);
+        pthread_setname_np(flipThread, "flip");
         flipStarted = true;
     }
     pthread_mutex_lock(&flipMutex);

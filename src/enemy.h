@@ -1392,6 +1392,14 @@ struct Crocodile : Enemy {
         bool water = getRoom().flags.water || modelWater == -1;
         flying     = water;
         stand      = water ? STAND_UNDERWATER : STAND_GROUND;
+        aggression = formAggression(water);
+    }
+
+    // the original's two creatures: the land crocodile (smartness 0x2000) and
+    // the alligator in the water (0x400) - TRX crocodile.c M_CROCODILE_SMARTNESS
+    // and M_ALLIGATOR_SMARTNESS
+    static float formAggression(bool water) {
+        return water ? float(0x400) / float(0x7FFF) : float(0x2000) / float(0x7FFF);
     }
 
     const virtual TR::Model* getModel() {
@@ -1411,6 +1419,7 @@ struct Crocodile : Enemy {
             targetBox = TR::NO_BOX;
             animation.setModel(model);
             flying = water;
+            aggression = formAggression(water);
 
             int16 rIndex = getRoomIndex();
             if (water) {
