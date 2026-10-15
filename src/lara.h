@@ -4265,9 +4265,17 @@ struct Lara : Character {
         }
         if (stand == STAND_UNDERWATER) {
             offset.y += LARA_HEIGHT_WATER * 0.5f;
+            maxAscent = LARA_HEIGHT_WATER;      // the original's bad_neg underwater: -LARA_HEIGHT_UW
         }
 
-        collision = Collision(this, room, pos, offset, vel, radius, angleExt, minHeight, maxHeight, maxAscent, maxDescent);
+        float collAngle = angleExt;
+        if (stand == STAND_ONWATER && (flowVelocity.x != 0.0f || flowVelocity.z != 0.0f) && (vel.x != 0.0f || vel.z != 0.0f))
+            collAngle = normalizeAngle(PI2 + vec2(vel.z, vel.x).angle()); // dragged: walls where she goes (the original's coll->facing)
+
+        collision = Collision(this, room, pos, offset, vel, radius, collAngle, minHeight, maxHeight, maxAscent, maxDescent, stand == STAND_UNDERWATER);
+
+        if (stand == STAND_ONWATER && pos.y < opos.y - 2.0f)
+            pos = opos; // floating she is never lifted onto a ledge: it stops her, as the original
 
         if (!standHang && (collision.side == Collision::LEFT || collision.side == Collision::RIGHT)) {
             float rot = TURN_WALL_Y * Core::deltaTime;
@@ -4288,9 +4296,12 @@ struct Lara : Character {
         bool isLeftFoot = getLeadingFoot();
 
         if (stand == STAND_UNDERWATER) {
-            if (collision.side == Collision::TOP)
+            // as the original: nose down at the ceiling (unless already diving
+            // steeply), and up whenever she was pushed out of the floor - even
+            // when a wall was hit too - so she slides along uneven bottoms
+            if (collision.side == Collision::TOP && angle.x >= -45.0f * DEG2RAD)
                 rotateX(-TURN_WALL_X * Core::deltaTime);
-            if (collision.side == Collision::BOTTOM)
+            if (collision.floorHit)
                 rotateX( TURN_WALL_X * Core::deltaTime);
         }
 
@@ -4379,6 +4390,14 @@ struct Lara : Character {
                 stand = STAND_ONWATER;
             } else
                 stand = STAND_AIR;
+        } else if (stand == STAND_UNDERWATER && !dozy && !getRoom().flags.water) {
+            // out of the water (a current threw her over an edge): as the
+            // original, she falls - she never swims in the air
+            float speed = velocity.length() * 0.25f;
+            angle.x = angle.z = 0.0f;
+            velocity = vec3(sinf(angle.y) * speed, 0.0f, cosf(angle.y) * speed);
+            animation.setAnim(ANIM_FALL_FORTH);
+            stand = STAND_AIR;
         }
         if (dozy) stand = STAND_UNDERWATER;
     }
@@ -4408,9 +4427,18 @@ struct Lara : Character {
             #endif
                 TR::Box &b = level->boxes[boxes[1]];
                 target.x = (b.minX + b.maxX) * 0.5f;
-                if (target.y > b.floor)
-                    target.y = float(b.floor);
                 target.z = (b.minZ + b.maxZ) * 0.5f;
+                // the original's current (Box_CalculateTarget, Lara's lot can
+                // fly): the target keeps at least a block above the bottom of
+                // every box on the way (it starts at her own height)
+                target.y = pos.y;
+                TR::Box &own = level->boxes[box];
+                target.y = min(target.y, float(own.floor) - 1024.0f);
+                target.y = min(target.y, float(b.floor) - 1024.0f);
+                // carried up to the surface at most: there she floats and
+                // breathes, as the original (never thrown above the water)
+                if (!(waterLevel == 0.0f && waterDepth == 0.0f))
+                    target.y = max(target.y, waterLevel - 1.0f);
             }
         }
 
@@ -4421,8 +4449,15 @@ struct Lara : Character {
             flowVelocity.y = clamp(target.y - pos.y, -speed, +speed);
             flowVelocity.z = clamp(target.z - pos.z, -speed, +speed);
 
-            if (stand == STAND_ONWATER)
-                goUnderwater();
+            if (stand == STAND_ONWATER) {
+                // floating, the current carries her along the surface; it
+                // only pulls her under when its target lies deep (the
+                // original dives at 100 units below the surface)
+                if (target.y - pos.y >= 100.0f)
+                    goUnderwater();
+                else
+                    flowVelocity.y = 0.0f;
+            }
         }
     }
 

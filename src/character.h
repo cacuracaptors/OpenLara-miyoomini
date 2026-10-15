@@ -216,7 +216,11 @@ struct Character : Controller {
             if (p != pos) {
                 if (updateZone())
                     updateLights();
-                else
+                else if (getEntity().isLara()) {
+                    // never undone for Lara: as the original, she moves through
+                    // any free space, boxes are only the enemies' map
+                    updateLights();
+                } else
                     pos = p;
             }
         }

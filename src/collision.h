@@ -15,10 +15,17 @@ struct Collision {
         float floor, ceiling;
     } info[4];
 
-    Collision() : side(NONE) {}
+    bool floorHit;      // swimming: pushed up out of the floor (the original pitches up then)
 
-    Collision(Controller *controller, int roomIndex, vec3 &pos, const vec3 &offset, const vec3 &velocity, float radius, float angle, int minHeight, int maxHeight, int maxAscent, int maxDescent) {
-        if (velocity.x > 0.0f || velocity.z > 0.0f)
+    Collision() : side(NONE), floorHit(false) {}
+
+    // swim: Lara underwater, with the original's rules (TRX collision/common.c,
+    // lara/col/swim.c): any floor or ceiling she went into pushes her out
+    Collision(Controller *controller, int roomIndex, vec3 &pos, const vec3 &offset, const vec3 &velocity, float radius, float angle, int minHeight, int maxHeight, int maxAscent, int maxDescent, bool swim = false) {
+        floorHit = false;
+        // the walls are tested where she moves (the original's coll->facing);
+        // underwater any direction counts (dragged by a current she may face away)
+        if (velocity.x > 0.0f || velocity.z > 0.0f || (swim && (velocity.x != 0.0f || velocity.z != 0.0f)))
             angle = normalizeAngle(PI2 + vec2(velocity.z, velocity.x).angle());
         pos += velocity;
 
@@ -52,7 +59,7 @@ struct Collision {
 
         float hCell = info[NONE].ceiling - (hpos.y - maxHeight);
         if (hCell > 0) {
-            if (hCell > 128) {
+            if (hCell > 128 && !swim) {
                 pos.x -= velocity.x;
                 pos.z -= velocity.z;
                 side = FRONT;
@@ -63,9 +70,10 @@ struct Collision {
         }
 
         float hFloor = info[NONE].floor - (hpos.y + minHeight);
-        if (hFloor < 0 && hFloor > -256) {
+        if (hFloor < 0 && (hFloor > -256 || swim)) {
             pos.y = info[NONE].floor - minHeight - offset.y;
             side  = BOTTOM;
+            floorHit = swim;
         }
 
         if (checkHeight(controller, roomIndex, hpos, f, height, maxAscent, maxDescent, FRONT)) {
