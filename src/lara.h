@@ -2014,11 +2014,18 @@ struct Lara : Character {
         if (!limit->alignHoriz)
             fx = (m.transpose() * vec4(pos - controller->pos, 0.0f)).x;
 
-        vec3 targetPos = controller->pos + (m * vec4(fx, limit->dy, limit->dz, 0.0f)).xyz();
+        // The results are copied out one by one: read through xyz() (a vec3
+        // over the vec4 temporary) the Miyoo's compiler took the value of the
+        // other temporary here - the target offset itself - and anything
+        // within reach distance passed the test below (Lara took the block
+        // behind the one she faced and ended up inside the front one).
+        vec4 tOff = m * vec4(fx, limit->dy, limit->dz, 0.0f);
+        vec3 targetPos = controller->pos + vec3(tOff.x, tOff.y, tOff.z);
 
         vec3 deltaAbs = pos - targetPos;
 
-        vec3 deltaRel = (m.transpose() * vec4(pos - controller->pos, 0.0f)).xyz(); // inverse transform
+        vec4 tRel = m.transpose() * vec4(pos - controller->pos, 0.0f); // inverse transform
+        vec3 deltaRel(tRel.x, tRel.y, tRel.z);
         
         // set item orientation to hack limits check
         if (limit->box.contains(deltaRel)) {
@@ -4233,8 +4240,137 @@ struct Lara : Character {
         #pragma GCC optimize ("O0")
     #endif
 
+    // The original's water current (TR1 LaraWaterCurrent): the current shifts
+    // her on its own, before she swims, with a collision of its own whose
+    // walls only stop the part of the shift that goes into them - she slides
+    // along the banks, turned away from them 5 degrees a frame. Her own
+    // swimming then collides from where the current left her. Done together,
+    // a bank she touched undid the current's whole shift, and she stuck to the
+    // sides of the rapids.
+    void moveByCurrent() {
+        if (stand != STAND_ONWATER && stand != STAND_UNDERWATER) return;
+        vec3 shift = flowVelocity * Core::deltaTime * 30.0f;
+        if (shift.x == 0.0f && shift.y == 0.0f && shift.z == 0.0f) return;
+
+        const bool  surf    = (stand == STAND_ONWATER);
+        const float radius  = surf ? LARA_RADIUS : LARA_RADIUS_WATER;
+        const float badNeg  = surf ? -100.0f : -float(LARA_HEIGHT_WATER);   // the surface's / the swim's bad_neg
+        const float badCeil = surf ?  100.0f :  float(LARA_HEIGHT_WATER);   // ... and bad_ceiling
+        const float H       = float(LARA_HEIGHT_WATER);                    // tested as a swimmer: 400 high, centred on her
+
+        vec3 old = pos;
+        pos += shift;
+
+        // the probe point: half her swimming height below her (LARA_HEIGHT_UW / 2)
+        const vec3 c = pos + vec3(0.0f, H * 0.5f, 0.0f);
+        const float yTop = c.y - H - 160.0f;    // where the sectors are looked up (y - M_HEADROOM)
+
+        // the walls where the current takes her, in the original's 16-bit
+        // angles: exactly diagonal goes to the next quadrant clockwise
+        float facing = (shift.x != 0.0f || shift.z != 0.0f) ? atan2f(shift.x, shift.z) : angle.y;
+        int q = (uint16(int(roundf(facing * 32768.0f / PI)) + 0x2000) >> 14) & 3;
+        float sn = sinf(facing) * radius, cs = cosf(facing) * radius;
+        vec2 pf, pl, pr;
+        switch (q) {
+            case 0  : pf = vec2(sn, radius);  pl = vec2(-radius,  radius); pr = vec2( radius,  radius); break; // north (+z)
+            case 1  : pf = vec2(radius, cs);  pl = vec2( radius,  radius); pr = vec2( radius, -radius); break; // east  (+x)
+            case 2  : pf = vec2(sn, -radius); pl = vec2( radius, -radius); pr = vec2(-radius, -radius); break; // south
+            default : pf = vec2(-radius, cs); pl = vec2(-radius, -radius); pr = vec2(-radius,  radius); break; // west
+        }
+
+        int room = getRoomIndex();
+        Collision::getFloor(level, room, vec3(c.x, yTop, c.z));
+
+        // floor below the probe point and ceiling below her top, as the original measures them
+        struct Side { float floor, ceiling; bool wall; };
+        Side mid, front, left, right;
+        Side *sides[] = { &mid, &front, &left, &right };
+        const vec2 probes[] = { vec2(0.0f), pf, pl, pr };
+        for (int i = 0; i < 4; i++) {
+            TR::Level::FloorInfo info;
+            getFloorInfo(room, vec3(c.x + probes[i].x, yTop, c.z + probes[i].y), info);
+            sides[i]->wall    = (info.floor == info.ceiling);
+            sides[i]->floor   = sides[i]->wall ? -float(0xFFFFFF) : info.floor - c.y;
+            sides[i]->ceiling = sides[i]->wall ?  float(0xFFFFFF) : info.ceiling - (c.y - H);
+        }
+
+        // Room_FindGridShift: out of the sector 'from' lies in, back into the one of 'to'
+        struct Grid {
+            static float shift(float from, float to) {
+                int a = int(from) >> 10, b = int(to) >> 10;
+                if (a == b) return 0.0f;
+                from -= float(a << 10);
+                return (b > a) ? (1025.0f - from) : (-from - 1.0f);
+            }
+        };
+
+        enum { C_NONE, C_FRONT, C_TOP, C_TOP_FRONT, C_LEFT, C_RIGHT, C_CLAMP } type = C_NONE;
+        vec3 d(0.0f);
+
+        if (mid.wall) {
+            d = old - pos;
+            type = C_FRONT;
+        } else if (mid.floor - mid.ceiling <= 0.0f) {
+            d = old - pos;
+            type = C_CLAMP;
+        } else {
+            if (mid.ceiling >= 0.0f) {
+                d.y  = mid.ceiling;
+                type = C_TOP;
+            }
+            if (front.floor < badNeg || front.ceiling > badCeil) {
+                if (q == 0 || q == 2) {
+                    d.x = old.x - pos.x;
+                    d.z = Grid::shift(c.z + pf.y, c.z);
+                } else {
+                    d.x = Grid::shift(c.x + pf.x, c.x);
+                    d.z = old.z - pos.z;
+                }
+                type = C_FRONT;
+            } else if (front.ceiling >= badCeil) {
+                d = old - pos;
+                type = C_TOP_FRONT;
+            } else if (left.floor < badNeg) {
+                if (q == 0 || q == 2) d.x = Grid::shift(c.x + pl.x, c.x + pf.x);
+                else                  d.z = Grid::shift(c.z + pl.y, c.z + pf.y);
+                type = C_LEFT;
+            } else if (right.floor < badNeg) {
+                if (q == 0 || q == 2) d.x = Grid::shift(c.x + pr.x, c.x + pf.x);
+                else                  d.z = Grid::shift(c.z + pr.y, c.z + pf.y);
+                type = C_RIGHT;
+            }
+        }
+
+        const float turnY = TURN_WALL_Y * Core::deltaTime;   // 5 degrees a frame
+        const float turnX = TURN_WALL_X * Core::deltaTime;   // LARA_UW_WALL_DEFLECT, 2 degrees a frame
+        switch (type) {
+            case C_FRONT :
+                if (!surf && angle.x > TURN_WALL_X_CLAMP)       rotateX( turnX);
+                else if (!surf && angle.x < -TURN_WALL_X_CLAMP) rotateX(-turnX);
+                else velocity = vec3(0.0f);
+                break;
+            case C_TOP       : if (!surf) rotateX(-turnX); break;
+            case C_TOP_FRONT : velocity = vec3(0.0f); break;
+            case C_LEFT      : rotateY( turnY); break;
+            case C_RIGHT     : rotateY(-turnY); break;
+            default          : ;
+        }
+
+        // a floor above the probe point lifts her (underwater only: floating
+        // she is never lifted onto a ledge, see move())
+        if (!surf && mid.floor < 0.0f && !mid.wall) {
+            pos.y += mid.floor;
+            rotateX(turnX);
+        }
+
+        pos += d;
+        if (surf) pos.y = old.y;    // the surface carries her along it
+        updateRoom();
+    }
+
     void move() {
-        vec3 vel = (velocity + flowVelocity) * Core::deltaTime * 30.0f + collisionOffset;
+        moveByCurrent();
+        vec3 vel = velocity * Core::deltaTime * 30.0f + collisionOffset;
         vec3 opos(pos), offset(0.0f);
 
         float radius   = stand == STAND_UNDERWATER ? LARA_RADIUS_WATER : LARA_RADIUS;
@@ -4268,11 +4404,7 @@ struct Lara : Character {
             maxAscent = LARA_HEIGHT_WATER;      // the original's bad_neg underwater: -LARA_HEIGHT_UW
         }
 
-        float collAngle = angleExt;
-        if (stand == STAND_ONWATER && (flowVelocity.x != 0.0f || flowVelocity.z != 0.0f) && (vel.x != 0.0f || vel.z != 0.0f))
-            collAngle = normalizeAngle(PI2 + vec2(vel.z, vel.x).angle()); // dragged: walls where she goes (the original's coll->facing)
-
-        collision = Collision(this, room, pos, offset, vel, radius, collAngle, minHeight, maxHeight, maxAscent, maxDescent, stand == STAND_UNDERWATER);
+        collision = Collision(this, room, pos, offset, vel, radius, angleExt, minHeight, maxHeight, maxAscent, maxDescent, stand == STAND_UNDERWATER);
 
         if (stand == STAND_ONWATER && pos.y < opos.y - 2.0f)
             pos = opos; // floating she is never lifted onto a ledge: it stops her, as the original
@@ -4426,8 +4558,11 @@ struct Lara : Character {
                 //memcpy(dbgBoxes, boxes, sizeof(uint16) * dbgBoxesCount);
             #endif
                 TR::Box &b = level->boxes[boxes[1]];
-                target.x = (b.minX + b.maxX) * 0.5f;
-                target.z = (b.minZ + b.maxZ) * 0.5f;
+                // the original's target (Box_CalculateTarget): as far as she
+                // goes in a straight line along the boxes, the sink in its box
+                vec3 t = boxTarget(boxes, count, true, target);
+                target.x = t.x;
+                target.z = t.z;
                 // the original's current (Box_CalculateTarget, Lara's lot can
                 // fly): the target keeps at least a block above the bottom of
                 // every box on the way (it starts at her own height)

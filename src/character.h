@@ -6,6 +6,116 @@
 #include "sprite.h"
 
 struct Character : Controller {
+    // TR2+: random numbers in the original's 0..32767 range
+    int randTR() {
+        return rand() & 0x7FFF;     // the original's random range (0..32767), on any platform
+    }
+
+    // The original's Box_CalculateTarget (TR1-TR3), for the enemies and for
+    // the water current that carries Lara: walks the boxes from its
+    // own one towards the target box and keeps the farthest point it can
+    // reach in a straight line; in the target box it heads for the goal.
+    vec3 boxTarget(const uint16 *chain, int count, bool reachesGoal, const vec3 &goal) {
+        enum { CL = 1, CR = 2, CT = 4, CB = 8, CALL = 15, CSEC = 16, BIFF = 512 };
+        const int ver = level->version & TR::VER_VERSION;
+        const int e   = ver <= TR::VER_TR1 ? 0 : 1;     // TR2+ boxes: OpenLara keeps max = original's max + 1
+        const int px  = int(pos.x), pz = int(pos.z);
+        int tx = px, ty = int(pos.y), tz = pz;
+        int left = 0, right = 0, top = 0, bottom = 0;
+        if (ver == TR::VER_TR3) {
+            const TR::Box &o = level->boxes[chain[0]];
+            left = o.minZ; right = o.maxZ - e; top = o.minX; bottom = o.maxX - e;
+        }
+        int primeFree = CALL;
+        const TR::Box *b = NULL;
+        int bL = 0, bR = 0, bT = 0, bB = 0;
+
+        for (int i = 0; i < count; i++) {
+            b  = &level->boxes[chain[i]];
+            bL = b->minZ; bR = b->maxZ - e; bT = b->minX; bB = b->maxX - e;
+            ty = min(ty, int(b->floor));
+
+            if (pz >= bL && pz <= bR && px >= bT && px <= bB) {
+                left = bL; right = bR; top = bT; bottom = bB;
+            } else {
+                if (pz < bL) {
+                    if ((primeFree & CL) && px >= bT && px <= bB) {
+                        tz = max(tz, bL + BIFF);
+                        if (primeFree & CSEC) return vec3(float(tx), float(ty), float(tz));
+                        top = max(top, bT); bottom = min(bottom, bB);
+                        primeFree = CL;
+                    } else if (primeFree != CL) {
+                        tz = right - BIFF;
+                        if (primeFree != CALL) return vec3(float(tx), float(ty), float(tz));
+                        primeFree |= CSEC;
+                    }
+                } else if (pz > bR) {
+                    if ((primeFree & CR) && px >= bT && px <= bB) {
+                        tz = min(tz, bR - BIFF);
+                        if (primeFree & CSEC) return vec3(float(tx), float(ty), float(tz));
+                        top = max(top, bT); bottom = min(bottom, bB);
+                        primeFree = CR;
+                    } else if (primeFree != CR) {
+                        tz = left + BIFF;
+                        if (primeFree != CALL) return vec3(float(tx), float(ty), float(tz));
+                        primeFree |= CSEC;
+                    }
+                }
+
+                if (px < bT) {
+                    if ((primeFree & CT) && pz >= bL && pz <= bR) {
+                        tx = max(tx, bT + BIFF);
+                        if (primeFree & CSEC) return vec3(float(tx), float(ty), float(tz));
+                        left = max(left, bL); right = min(right, bR);
+                        primeFree = CT;
+                    } else if (primeFree != CT) {
+                        tx = bottom - BIFF;
+                        if (primeFree != CALL) return vec3(float(tx), float(ty), float(tz));
+                        primeFree |= CSEC;
+                    }
+                } else if (px > bB) {
+                    if ((primeFree & CB) && pz >= bL && pz <= bR) {
+                        tx = min(tx, bB - BIFF);
+                        if (primeFree & CSEC) return vec3(float(tx), float(ty), float(tz));
+                        left = max(left, bL); right = min(right, bR);
+                        primeFree = CB;
+                    } else if (primeFree != CB) {
+                        tx = top + BIFF;
+                        if (primeFree != CALL) return vec3(float(tx), float(ty), float(tz));
+                        primeFree |= CSEC;
+                    }
+                }
+            }
+
+            if (reachesGoal && i == count - 1) {
+                if (primeFree & (CL | CR))
+                    tz = int(goal.z);
+                else if (!(primeFree & CSEC))
+                    tz = clamp(tz, bL + BIFF, bR - BIFF);
+
+                if (primeFree & (CT | CB))
+                    tx = int(goal.x);
+                else if (!(primeFree & CSEC))
+                    tx = clamp(tx, bT + BIFF, bB - BIFF);
+
+                return vec3(float(tx), goal.y, float(tz));
+            }
+        }
+
+        // TR1-TR3: a fresh random point in the last box it can reach
+        if (primeFree & (CL | CR))
+            tz = bL + 512 + (((bR - bL - 1024) * randTR()) >> 15);
+        else if (!(primeFree & CSEC))
+            tz = clamp(tz, bL + BIFF, bR - BIFF);
+
+        if (primeFree & (CT | CB))
+            tx = bT + 512 + (((bB - bT - 1024) * randTR()) >> 15);
+        else if (!(primeFree & CSEC))
+            tx = clamp(tx, bT + BIFF, bB - BIFF);
+
+        return vec3(float(tx), float(b->floor), float(tz));
+    }
+
     float   health;
     float   tilt;
     quat    rotHead, rotChest;

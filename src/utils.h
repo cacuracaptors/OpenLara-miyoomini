@@ -1427,7 +1427,8 @@ struct Box {
 
     bool intersect(const mat4 &matrix, const vec3 &rayPos, const vec3 &rayDir, float &t) const {
         mat4 mInv = matrix.inverseOrtho();
-        return intersect(mInv * rayPos, (mInv * vec4(rayDir, 0)).xyz(), t);
+        vec4 d = mInv * vec4(rayDir, 0);   // copied out: not read through xyz() of a temporary
+        return intersect(mInv * rayPos, vec3(d.x, d.y, d.z), t);
     }
 };
 
