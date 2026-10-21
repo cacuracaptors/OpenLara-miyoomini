@@ -694,6 +694,7 @@ namespace GAPI {
 
     struct TriSW {
         const VertexSW *a, *b, *c;
+        const VertexSW *d;          // a quad's 4th corner, NULL for a triangle
     };
 
     #define SW_MAX_CMDS  8192
@@ -714,6 +715,8 @@ namespace GAPI {
         ColorSW   palWorld[256];         // scene palette
         ColorSW   palWater[256];         // scene palette with the underwater tint
         ColorSW   palUI[256];
+        ColorSW   litWorld[32 * 256];    // palWorld at each light level (spanPixelsTiledSW)
+        ColorSW   litWater[32 * 256];    // palWater at each light level
     };
 
     FrameSW  swFrames[2];
@@ -814,6 +817,7 @@ namespace GAPI {
         const uint8   *texels;   // tile indices; NULL for RGBA-textured 2D
         Texture       *tex;
         const ColorSW *pal;      // scene palette for this batch (dry or underwater)
+        const ColorSW *lit;      // the same at each light level
         bool           affine, ortho, testZ, writeZ;
         bool           tiled;
         bool           shadow;
@@ -928,6 +932,175 @@ namespace GAPI {
         }
     }
 
+    // ---- Coarse depth: hidden faces skipped before any work ---------------
+    // For each 8x8 block of the screen, the farthest depth in it. Depth only
+    // grows as faces are drawn, so an old value is still a safe bound. A face
+    // whose nearest point lies behind the farthest depth of every block it
+    // covers cannot show a single pixel, and is skipped before its setup and
+    // its rows (in the open areas half of what is drawn is wholly hidden). A
+    // block something wrote depth into is marked, and worked out again (64
+    // reads) the next time a face asks. The blocks are 8 rows high, as the
+    // cores' row groups: each belongs to one core. The very same picture.
+    // Asked per span too it cost more than it saved: spans ask right after
+    // writing, and every answer was a block worked out again.
+    #define SW_HIZ_SHIFT 3
+    uint16 *swHiZ      = NULL;
+    uint8  *swHiZDirty = NULL;
+    int     swHiZW = 0, swHiZH = 0;
+    // 2: hidden faces skipped; 4: a span converts its start only once its
+    // first stretch passed the depth test (a hidden span then costs nothing)
+    #define SW_HIZ_FACES 2
+    #define SW_HIZ_LAZY  4
+    static const int swHiZOn = SW_HIZ_FACES | SW_HIZ_LAZY;
+
+    static inline void swHiZInit() {
+        const int w = (Core::width + 7) >> 3, h = (Core::height + 7) >> 3;
+        if (swHiZ && w == swHiZW && h == swHiZH) return;
+        delete[] swHiZ;
+        delete[] swHiZDirty;
+        swHiZW = w; swHiZH = h;
+        swHiZ      = new uint16[w * h];
+        swHiZDirty = new uint8[w * h];
+        memset(swHiZ, 0, w * h * sizeof(uint16));      // nothing known: nothing is hidden
+        memset(swHiZDirty, 0, w * h);
+    }
+
+    // the farthest depth in block (bx, by)
+    static inline int32 swHiZGet(int bx, int by) {
+        const int i = by * swHiZW + bx;
+        if (swHiZDirty[i]) {
+            const int W = Core::width, H = Core::height;
+            const int x0 = bx << 3, y0 = by << 3;
+            const int w  = W - x0 < 8 ? W - x0 : 8;
+            const int h  = H - y0 < 8 ? H - y0 : 8;
+            const DepthSW *d = swDepth + y0 * W + x0;
+            uint32 m = 0xFFFF;
+            for (int r = 0; r < h; r++, d += W)
+                for (int k = 0; k < w; k++)
+                    if (d[k] < m) m = d[k];
+            swHiZ[i]      = uint16(m);
+            swHiZDirty[i] = 0;
+        }
+        return swHiZ[i];
+    }
+
+    // the depth code a face whose nearest 1/w is q can reach, with
+    // room to spare: its pixels' 1/w is worked out by steps, a hair off the
+    // exact value, and nothing may be skipped that would have shown
+    static inline int32 swHiZCode(float q) {
+        int32 z = int32(q * (536870912.0f * 1.0625f)) + 256;
+        if (z < 0) z = 0; else if (z > (65535 << 8)) z = 65535 << 8;
+        return depthCodeSW(z);
+    }
+
+    // every block of row group by, columns bx0..bx1, is nearer everywhere than depth code cn
+    static inline bool swHiZHidden(int by, int bx0, int bx1, int32 cn) {
+        for (int bx = bx0; bx <= bx1; bx++)
+            if (swHiZGet(bx, by) <= cn) return false;
+        return true;
+    }
+
+    // depth is about to be written in row y, pixels [x0, x1)
+    static inline void swHiZMark(int y, int x0, int x1) {
+        uint8 *p = swHiZDirty + (y >> SW_HIZ_SHIFT) * swHiZW;
+        const int b1 = (x1 - 1) >> 3;
+        for (int bx = x0 >> 3; bx <= b1; bx++) p[bx] = 1;
+    }
+
+    // a face whose nearest point has 1/w = qMax, over screen columns [fx0, fx1]
+    // and rows [y0, y1): hidden on all the rows of this core?
+    static inline bool swHiZFaceHidden(const RasterCtxSW &ctx, int y0, int y1, float fx0, float fx1, float qMax) {
+        if (!(swHiZOn & SW_HIZ_FACES) || !swHiZ || !ctx.testZ || !swDepth) return false;
+        int x0 = int(fx0) - 1, x1 = int(fx1) + 1;
+        if (x0 < ctx.clip.x) x0 = ctx.clip.x;
+        if (x1 > ctx.clip.z - 1) x1 = ctx.clip.z - 1;
+        if (x0 > x1) return true;
+        const int32 cn = ctx.sky ? 0 : swHiZCode(qMax);
+        const int bx0 = x0 >> 3, bx1 = x1 >> 3;
+        for (int by = y0 >> 3; by <= (y1 - 1) >> 3; by++) {
+            if (!ownsRowSW(ctx, by << 3)) continue;
+            if (!swHiZHidden(by, bx0, bx1, cn)) return false;
+        }
+        return true;
+    }
+
+    // ---- The pixel loop of tiled textures, shorter: the very same pixels ----
+    // The texel address in the 8x8-block layout (tiledIndexSW) took eleven
+    // instructions a pixel. Here u and v are kept with their bits already in
+    // the places the address wants them (u: 0-2 and 6-10, v: 3-5 and 11-15,
+    // over 16 bits of fraction), the bits in between set to 1, so a plain add
+    // carries across them: a step is an add and an or, and the address an and
+    // (the same wrapping inside the 256x256 page as before). And the colour
+    // takes one read: the palette already lit at each of the 32 levels, made
+    // once a frame, instead of the light table and then the palette.
+    #define SW_TU_GAP 0xF8380000u   // u's packed form: v's places set
+    #define SW_TV_GAP 0x07C70000u   // v's packed form: u's places set
+    static const bool swSpanFast = true;
+
+    static inline uint32 swPackU(int32 u) {      // bits 16-18 stay, 19-23 go to 22-26
+        const uint32 x = uint32(u);
+        return (x & 0x0007FFFFu) | ((x & 0x00F80000u) << 3);
+    }
+    static inline uint32 swPackV(int32 v) {      // bits 16-18 go to 19-21, 19-23 to 27-31
+        const uint32 x = uint32(v);
+        return (x & 0x0000FFFFu) | ((x & 0x00070000u) << 3) | ((x & 0x00F80000u) << 8);
+    }
+
+    template <bool TEST_Z, bool WRITE_Z, bool FLAT_LIGHT, bool ZCODE>
+    static inline void spanPixelsTiledSW(int &x, int len, ColorSW *color, DepthSW *depth,
+                                         const uint8 *texels, const ColorSW *lit,
+                                         int32 u, int32 du, int32 v, int32 dv, int32 lv, int32 dl, int32 z, int32 dz) {
+        ColorSW       *c    = color - x;                    // mirrored: walks down
+        DepthSW       *d    = (TEST_Z || WRITE_Z) ? depth + x : NULL;
+        const ColorSW *lrow = lit + ((lv >> 19) << 8);
+        uint32 pu = swPackU(u) | SW_TU_GAP, pdu = swPackU(du);
+        uint32 pv = swPackV(v) | SW_TV_GAP, pdv = swPackV(dv);
+        x += len;
+        for (int k = len; k > 0; k--, c--) {
+            const int32 zc = (TEST_Z || WRITE_Z) ? (ZCODE ? depthCodeSW(z) : (z >> 8)) : 0;
+            if (!TEST_Z || zc >= int32(*d)) {
+                const uint8 index = texels[(pu & pv) >> 16];
+                if (index != 0) {
+                    *c = FLAT_LIGHT ? lrow[index] : lit[((lv >> 19) << 8) + index];
+                    if (WRITE_Z) *d = DepthSW(zc);
+                }
+            }
+            if (TEST_Z || WRITE_Z) d++;
+            pu = (pu + pdu) | SW_TU_GAP;
+            pv = (pv + pdv) | SW_TV_GAP;
+            z += dz;
+            if (!FLAT_LIGHT) lv += dl;
+        }
+    }
+
+    // ---- The stretches' depth, worked out once -----------------------------
+    // The test "the whole stretch is behind what is drawn" converted and coded
+    // the depth of its nearer end, and drawing it then converted and coded
+    // both ends again. Converting and coding never decrease, so the nearer
+    // end's code is the larger of the two ends' codes: each end is worked out
+    // once, and the next stretch starts from this one's end. The test itself
+    // reads the 16 depths 8 at a time (NEON). The very same pixels.
+    static const bool swSpanSetup = true;
+
+    // every one of the len depths at d is nearer than code cn
+    static inline bool swStretchHiddenSW(const DepthSW *d, int len, int32 cn) {
+        if (int32(d[0]) <= cn) return false;        // most stretches that show, show here
+    #if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        if (len >= 8 && cn < 65535) {
+            const uint16x8_t c8 = vdupq_n_u16(uint16(cn));
+            uint16x8_t m = vdupq_n_u16(0xFFFF);
+            int k = 0;
+            for (; k + 8 <= len; k += 8) m = vandq_u16(m, vcgtq_u16(vld1q_u16(d + k), c8));
+            const uint32x2_t r = vreinterpret_u32_u16(vand_u16(vget_low_u16(m), vget_high_u16(m)));
+            if ((vget_lane_u32(r, 0) & vget_lane_u32(r, 1)) != 0xFFFFFFFFu) return false;
+            for (; k < len; k++) if (int32(d[k]) <= cn) return false;
+            return true;
+        }
+    #endif
+        for (int k = 1; k < len; k++) if (int32(d[k]) <= cn) return false;
+        return true;
+    }
+
     // Shadow blobs: halve the brightness of what is already on screen, depth
     // tested and without writing depth; the software counterpart of the
     // multiply blend the GPU renderers use.
@@ -962,6 +1135,7 @@ namespace GAPI {
         float pv = pV.dx * xc + pV.dy * yc + pV.c;
         float pq = pQ.dx * xc + pQ.dy * yc + pQ.c;
         float l  = pL.dx * xc + pL.dy * yc + pL.c;
+        if (ctx.writeZ && swHiZ && swDepth) swHiZMark(y, x0, x1);
 
         const int32    row      = y * Core::width;
         ColorSW       *color    = ctx.colorEnd - row;     // mirrored: pixel x at color[-x]
@@ -973,15 +1147,20 @@ namespace GAPI {
         const bool     sky      = ctx.sky;
         const uint8   *lightSel = ctx.frame->lightSel;
         const ColorSW *palWorld = ctx.pal;
+        const ColorSW *lit      = ctx.lit;
+        const bool     fast     = tiled && swSpanFast && lit;
         const int32    UV_MAX   = (256 << 16) - 1;
         const int32    LV_MAX   = (32 << 19) - 1;
         const int32    Z_MAX    = (65535 << 8);
 
-        float invA = 1.0f / (pq < 1e-6f ? 1e-6f : pq);
-
         // the start of each stretch is the end of the last one: only the first
-        // stretch converts its start (float to integer is slow on this CPU)
-        int32 ua, va, lvA, zA;
+        // stretch converts its start (float to integer is slow on this CPU),
+        // and with SW_HIZ_LAZY only once it passed the depth test, as after a skip
+        float invA = 0.0f;
+        int32 ua = 0, va = 0, lvA = 0, zA = 0;
+        bool needA = (swHiZOn & SW_HIZ_LAZY) != 0;  // the start of the stretch to work out (after a skip)
+        if (!needA) {
+        invA = 1.0f / (pq < 1e-6f ? 1e-6f : pq);
         if (affine) {
             ua = int32(pu);
             va = int32(pv);
@@ -995,8 +1174,14 @@ namespace GAPI {
         if (lvA < 0) lvA = 0; else if (lvA > LV_MAX) lvA = LV_MAX;
         zA = int32(pq * 536870912.0f);
         if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
-
-        bool needA = false;     // the start of the stretch to work out again (after a skip)
+        }
+        const bool setup2 = swSpanSetup;
+        int32 codeA = 0;
+        if (setup2) {
+            zA = int32(pq * 536870912.0f);
+            if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
+            codeA = sky ? 0 : depthCodeSW(zA);
+        }
 
         int x = x0;
         while (x < x1) {
@@ -1013,11 +1198,21 @@ namespace GAPI {
             float pv1 = pv + pV.dx * float(len);
             float pq1 = pq + pQ.dx * float(len);
             float l1  = l  + pL.dx * float(len);
+            int32 zB = 0, codeB = 0;
+            if (setup2) {
+                zB = int32(pq1 * 536870912.0f);
+                if (zB < 0) zB = 0; else if (zB > Z_MAX) zB = Z_MAX;
+                codeB = sky ? 0 : depthCodeSW(zB);
+            }
 
             // the whole stretch behind what is already drawn: skipped at once,
             // without its perspective step (none of its pixels would pass the
             // depth test: 1/w is linear, so its nearest point is an end)
             if (testZ) {
+                bool hidden;
+                if (setup2) {
+                    hidden = swStretchHiddenSW(depth + x, len, codeA > codeB ? codeA : codeB);   // the sky: both 0
+                } else {
                 int32 cn = 0;                       // the sky: "infinitely" far
                 if (!sky) {
                     float qn = pq > pq1 ? pq : pq1;
@@ -1028,13 +1223,17 @@ namespace GAPI {
                 const DepthSW *d = depth + x;
                 int k = 0;
                 while (k < len && int32(d[k]) > cn) k++;
-                if (k == len) {
+                hidden = k == len;
+                }
+                if (hidden) {
                     x  += len;
                     pu  = pu1;
                     pv  = pv1;
                     pq  = pq1;
                     l   = l1;
                     needA = true;
+                    zA    = zB;
+                    codeA = codeB;
                     continue;
                 }
             }
@@ -1051,8 +1250,10 @@ namespace GAPI {
                 if (va < 0) va = 0; else if (va > UV_MAX) va = UV_MAX;
                 lvA = int32(l);
                 if (lvA < 0) lvA = 0; else if (lvA > LV_MAX) lvA = LV_MAX;
-                zA = int32(pq * 536870912.0f);
-                if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
+                if (!setup2) {
+                    zA = int32(pq * 536870912.0f);
+                    if (zA < 0) zA = 0; else if (zA > Z_MAX) zA = Z_MAX;
+                }
                 needA = false;
             }
 
@@ -1069,15 +1270,18 @@ namespace GAPI {
             if (vb < 0) vb = 0; else if (vb > UV_MAX) vb = UV_MAX;
             int32 lvB = int32(l1);
             if (lvB < 0) lvB = 0; else if (lvB > LV_MAX) lvB = LV_MAX;
-            int32 zB = int32(pq1 * 536870912.0f);
-            if (zB < 0) zB = 0; else if (zB > Z_MAX) zB = Z_MAX;
+            if (!setup2) {
+                zB = int32(pq1 * 536870912.0f);
+                if (zB < 0) zB = 0; else if (zB > Z_MAX) zB = Z_MAX;
+            }
 
             // steps: a shift for the usual 16-pixel stretch instead of a division
             int32 u  = ua, v = va;
             int32 du, dv, dl, dz;
             // depth: codes at both ends of the stretch; with the same exponent at
             // both, the code follows 1/w linearly and is just stepped
-            const int32 zcA = sky ? 0 : (depthCodeSW(zA) << 8), zcB = sky ? 0 : (depthCodeSW(zB) << 8);   // the sky: "infinitely" far
+            const int32 zcA = setup2 ? (codeA << 8) : sky ? 0 : (depthCodeSW(zA) << 8);   // the sky: "infinitely" far
+            const int32 zcB = setup2 ? (codeB << 8) : sky ? 0 : (depthCodeSW(zB) << 8);
             const bool  zcode = (zcA >> 20) != (zcB >> 20);   // crosses an exponent
             const int32 zS = zcode ? zA : zcA, zE = zcode ? zB : zcB;
             if (len == 16) {
@@ -1101,8 +1305,10 @@ namespace GAPI {
 
             const bool flat = (lvA >> 19) == (lvB >> 19);
             #define SW_ARGS x, len, color, depth, texels, lightSel, palWorld, u, du, v, dv, lv, dl, z, dz
+            #define SW_ARGS_T x, len, color, depth, texels, lit, u, du, v, dv, lv, dl, z, dz
             #define SW_SPAN2(TZ, WZ, ZC) { \
-                if (tiled) { if (flat) spanPixelsSW<TZ, WZ, true,  true,  ZC>(SW_ARGS); else spanPixelsSW<TZ, WZ, true,  false, ZC>(SW_ARGS); } \
+                if (fast)  { if (flat) spanPixelsTiledSW<TZ, WZ, true, ZC>(SW_ARGS_T); else spanPixelsTiledSW<TZ, WZ, false, ZC>(SW_ARGS_T); } \
+                else if (tiled) { if (flat) spanPixelsSW<TZ, WZ, true,  true,  ZC>(SW_ARGS); else spanPixelsSW<TZ, WZ, true,  false, ZC>(SW_ARGS); } \
                 else       { if (flat) spanPixelsSW<TZ, WZ, false, true,  ZC>(SW_ARGS); else spanPixelsSW<TZ, WZ, false, false, ZC>(SW_ARGS); } }
             #define SW_SPAN(TZ, WZ) { if (zcode) SW_SPAN2(TZ, WZ, true) else SW_SPAN2(TZ, WZ, false) }
             if (testZ) {
@@ -1115,6 +1321,7 @@ namespace GAPI {
             #undef SW_SPAN
             #undef SW_SPAN2
             #undef SW_ARGS
+            #undef SW_ARGS_T
             pu = pu1;
             pv = pv1;
             pq = pq1;
@@ -1123,6 +1330,7 @@ namespace GAPI {
             va  = vb;
             lvA = lvB;
             zA  = zB;
+            codeA = codeB;
         }
     }
 
@@ -1163,6 +1371,12 @@ namespace GAPI {
             firstOwned = ((firstOwned >> SW_BAND_SHIFT) + 1) << SW_BAND_SHIFT;
         }
         if (firstOwned >= y1) return;
+        if (!ctx.ortho && !ctx.shadow) {
+            float fx0 = t->fx, fx1 = t->fx, qm = t->pq;
+            if (m->fx < fx0) fx0 = m->fx; if (m->fx > fx1) fx1 = m->fx; if (m->pq > qm) qm = m->pq;
+            if (d->fx < fx0) fx0 = d->fx; if (d->fx > fx1) fx1 = d->fx; if (d->pq > qm) qm = d->pq;
+            if (swHiZFaceHidden(ctx, firstOwned, y1, fx0, fx1, qm)) return;
+        }
 
         const float invArea = 1.0f / area;
         const bool  noTex   = (ctx.texels == NULL);
@@ -1210,6 +1424,135 @@ namespace GAPI {
                 if (ctx.ortho) drawSpanOrthoSW(ctx, y, x0, x1, pU, pV, pL, noTex, solid, primColor);
                 else           drawSpanSW(ctx, y, x0, x1, pU, pV, pQ, pL);
             }
+        }
+    }
+
+    // A quad drawn whole, as the original game's renderer did: each row is one
+    // span, its values taken along the quad's two side edges, instead of one
+    // span for each of the two triangles OpenLara cut it into. Nine in ten
+    // faces of a level are quads, and the work of starting a span (the plane
+    // values, a division, conversions) was paid twice on most rows. Covers
+    // exactly the same pixels; a quad whose light (or texture) is not even
+    // over it shades smoothly across instead of in two halves. Quads that are
+    // not convex on screen stay two triangles.
+    struct QuadEdgeSW {
+        const VertexSW *p, *q;      // from p down to q
+        int   ip, iq;
+        float x0, y0, dxdy;
+        float a0[4], dady[4];
+    };
+
+    static inline void quadEdgeSetSW(QuadEdgeSW &e, const VertexSW *const *v, const float (*A)[4], int ip, int iq) {
+        e.ip = ip; e.iq = iq;
+        e.p  = v[ip]; e.q = v[iq];
+        const float dy  = e.q->fy - e.p->fy;
+        const float inv = dy > 0.0f ? 1.0f / dy : 0.0f;
+        e.x0   = e.p->fx;
+        e.y0   = e.p->fy;
+        e.dxdy = (e.q->fx - e.p->fx) * inv;
+        for (int k = 0; k < 4; k++) {
+            e.a0[k]   = A[ip][k];
+            e.dady[k] = (A[iq][k] - A[ip][k]) * inv;
+        }
+    }
+
+    void rasterQuadSW(RasterCtxSW &ctx, const VertexSW *a, const VertexSW *b, const VertexSW *c, const VertexSW *d) {
+        const VertexSW *v[4] = { a, b, c, d };
+        // convex on screen, every corner turning the same way
+        int sign = 0;
+        bool convex = true;
+        for (int i = 0; i < 4 && convex; i++) {
+            const VertexSW *p = v[i], *q = v[(i + 1) & 3], *r = v[(i + 2) & 3];
+            const float cr = (q->fx - p->fx) * (r->fy - q->fy) - (q->fy - p->fy) * (r->fx - q->fx);
+            if (cr > 1e-3f)       { if (sign < 0) convex = false; sign =  1; }
+            else if (cr < -1e-3f) { if (sign > 0) convex = false; sign = -1; }
+            else convex = false;
+        }
+        if (!convex) {
+            rasterTriangleSW(ctx, a, b, c);
+            rasterTriangleSW(ctx, a, c, d);
+            return;
+        }
+
+        int it = 0, ib = 0;
+        for (int i = 1; i < 4; i++) {
+            if (v[i]->fy < v[it]->fy) it = i;
+            if (v[i]->fy > v[ib]->fy) ib = i;
+        }
+        int y0 = ceilSW(v[it]->fy - 0.5f);
+        int y1 = ceilSW(v[ib]->fy - 0.5f);
+        if (y0 < ctx.clip.y) y0 = ctx.clip.y;
+        if (y1 > ctx.clip.w) y1 = ctx.clip.w;
+        if (y0 >= y1) return;
+
+        int firstOwned = y0;
+        while (firstOwned < y1 && !ownsRowSW(ctx, firstOwned)) {
+            firstOwned = ((firstOwned >> SW_BAND_SHIFT) + 1) << SW_BAND_SHIFT;
+        }
+        if (firstOwned >= y1) return;
+        {
+            float fx0 = v[0]->fx, fx1 = v[0]->fx, qm = v[0]->pq;
+            for (int i = 1; i < 4; i++) {
+                if (v[i]->fx < fx0) fx0 = v[i]->fx;
+                if (v[i]->fx > fx1) fx1 = v[i]->fx;
+                if (v[i]->pq > qm)  qm  = v[i]->pq;
+            }
+            if (!ctx.ortho && swHiZFaceHidden(ctx, firstOwned, y1, fx0, fx1, qm)) return;
+        }
+
+        // u, v (texture), 1/w (depth and perspective) and light at each corner
+        float A[4][4];
+        for (int i = 0; i < 4; i++) {
+            A[i][0] = ctx.affine ? float(v[i]->u) : v[i]->pu;
+            A[i][1] = ctx.affine ? float(v[i]->v) : v[i]->pv;
+            A[i][2] = v[i]->pq;
+            A[i][3] = float(v[i]->l);
+        }
+
+        // the two sides, from the top corner down to the bottom one
+        QuadEdgeSW e0, e1;
+        quadEdgeSetSW(e0, v, A, it, (it + 1) & 3);
+        quadEdgeSetSW(e1, v, A, it, (it + 3) & 3);
+
+        PlaneSW pU, pV, pQ, pL;
+        pU.dy = pV.dy = pQ.dy = pL.dy = 0.0f;
+        PlaneSW *pl[4] = { &pU, &pV, &pQ, &pL };
+
+        for (int y = firstOwned; y < y1; y++) {
+            if (!ownsRowSW(ctx, y)) {
+                y = (((y >> SW_BAND_SHIFT) + 1) << SW_BAND_SHIFT) - 1;   // on to the next group
+                continue;
+            }
+            const float yc = float(y) + 0.5f;
+            while (yc >= e0.q->fy && e0.iq != ib) quadEdgeSetSW(e0, v, A, e0.iq, (e0.iq + 1) & 3);
+            while (yc >= e1.q->fy && e1.iq != ib) quadEdgeSetSW(e1, v, A, e1.iq, (e1.iq + 3) & 3);
+
+            const float t0 = yc - e0.y0, t1 = yc - e1.y0;
+            float xa = e0.x0 + e0.dxdy * t0;
+            float xb = e1.x0 + e1.dxdy * t1;
+            const QuadEdgeSW *eL = &e0, *eR = &e1;
+            float tl = t0, tr = t1;
+            if (xb < xa) {
+                float s = xa; xa = xb; xb = s;
+                eL = &e1; eR = &e0;
+                tl = t1; tr = t0;
+            }
+            int x0 = ceilSW(xa - 0.5f);
+            int x1 = ceilSW(xb - 0.5f);
+            if (x0 < ctx.clip.x) x0 = ctx.clip.x;
+            if (x1 > ctx.clip.z) x1 = ctx.clip.z;
+            if (x0 >= x1) continue;
+
+            // this row's values: straight across, from one side to the other
+            const float wdt = xb - xa;
+            const float inv = wdt > 1e-4f ? 1.0f / wdt : 0.0f;
+            for (int k = 0; k < 4; k++) {
+                const float al = eL->a0[k] + eL->dady[k] * tl;
+                const float ar = eR->a0[k] + eR->dady[k] * tr;
+                pl[k]->dx = (ar - al) * inv;
+                pl[k]->c  = al - pl[k]->dx * xa;
+            }
+            drawSpanSW(ctx, y, x0, x1, pU, pV, pQ, pL);
         }
     }
 
@@ -1350,6 +1693,7 @@ namespace GAPI {
             float k = t.a->pq;
             if (t.b->pq > k) k = t.b->pq;
             if (t.c->pq > k) k = t.c->pq;
+            if (t.d && t.d->pq > k) k = t.d->pq;
             swSortBuf[i].key = k;
             swSortBuf[i].tri = t;
         }
@@ -1370,6 +1714,19 @@ namespace GAPI {
         t.a = swBatchBase + ia;
         t.b = swBatchBase + ib;
         t.c = swBatchBase + ic;
+        t.d = NULL;
+    }
+
+    // quads whole (rasterQuadSW); the 2D (UI) and shadow batches keep them as
+    // two triangles, which their own spans need
+    static const bool swQuadsWhole = true;
+
+    static inline void swAddQuad(Index ia, Index ib, Index ic, Index id) {
+        TriSW &t = swRec->tris[swRec->triCount++];
+        t.a = swBatchBase + ia;
+        t.b = swBatchBase + ib;
+        t.c = swBatchBase + ic;
+        t.d = swBatchBase + id;
     }
 
     void drawTriangle(Index *indices) {
@@ -1391,6 +1748,10 @@ namespace GAPI {
         // the picked-up item: no culling (its winding is reversed with that
         // projection); the depth test sorts its faces
         if (!swModelInUI && checkBackface(t, m, b)) return;
+        if (swQuadsWhole && !swBatch->ortho && !swBatch->shadow && swRec->triCount < SW_MAX_TRIS) {
+            swAddQuad(indices[0], indices[1], indices[2], indices[3]);
+            return;
+        }
         swAddTri(indices[0], indices[1], indices[2]);
         swAddTri(indices[0], indices[2], indices[3]);
     }
@@ -1453,7 +1814,13 @@ namespace GAPI {
                 for (int y = 0; y < H; y++) {
                     if (!ownsRowSW(ctx, y)) continue;
                     if (cmd.color) memset(ctx.colorEnd - y * W - (W - 1), 0, W * sizeof(ColorSW));
-                    if (cmd.depth && swDepth) memset(swDepth + y * W, 0, W * sizeof(DepthSW));
+                    if (cmd.depth && swDepth) {
+                        memset(swDepth + y * W, 0, W * sizeof(DepthSW));
+                        if (swHiZ) {
+                            memset(swHiZ + (y >> 3) * swHiZW, 0, swHiZW * sizeof(uint16));
+                            memset(swHiZDirty + (y >> 3) * swHiZW, 0, swHiZW);
+                        }
+                    }
                 }
             } else if (cmd.type == SW_CMD_SNAPSHOT || cmd.type == SW_CMD_RESTORE) {
                 ColorSW *bgEnd = swMenuBg + W * H - 1;
@@ -1487,15 +1854,24 @@ namespace GAPI {
                 ctx.writeZ = cmd.writeZ;
                 ctx.clip   = cmd.clip;
                 ctx.pal    = cmd.water ? f.palWater : f.palWorld;
+                ctx.lit    = cmd.water ? f.litWater : f.litWorld;
                 ctx.shadow = cmd.shadow;
                 ctx.sky    = cmd.sky;
                 const TriSW *tri = f.tris + cmd.triStart;
                 for (int k = 0; k < cmd.triCount; k++, tri++) {
-                    rasterTriangleSW(ctx, tri->a, tri->b, tri->c);
+                    if (tri->d) rasterQuadSW(ctx, tri->a, tri->b, tri->c, tri->d);
+                    else        rasterTriangleSW(ctx, tri->a, tri->b, tri->c);
                 }
             }
         }
         pixels += ctx.pixels;
+    }
+
+    static void swBuildLitFrame(FrameSW &f) {
+        for (int i = 0; i < 32 * 256; i++) {
+            f.litWorld[i] = f.palWorld[f.lightSel[i]];
+            f.litWater[i] = f.palWater[f.lightSel[i]];
+        }
     }
 
     static void swBuildShadeFrame(FrameSW &f) {
@@ -1520,6 +1896,7 @@ namespace GAPI {
             f.palWorld[i] = col;
             f.palWater[i] = tintSW(col, 154, 230, 230);   // the level's underwater colour: 0.6, 0.9, 0.9
         }
+        swBuildLitFrame(f);
     }
 
     static void swBuildOwner(FrameSW &f, int k) {
@@ -1686,6 +2063,7 @@ namespace GAPI {
         f.colorEnd = f.buffer + W * H - 1;
 
         swBuildShadeFrame(f);
+        swHiZInit();
         swBuildOwner(f, swWorkerGroups);
 
         swPend = &f;

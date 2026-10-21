@@ -1456,8 +1456,10 @@ struct Controller {
 
     void renderSprite(int frame) {
         TR::Entity::Type type = getEntity().type;
-        float fDiffuse = TR::Entity::isPickup(type) ? 1.0f : 0.5f;
-        float fAmbient = (intensity < 0.0f ? intensityf(getRoom().ambient) : intensity) * fDiffuse;
+        // Pickups take the light of where they lie; effects (splashes, smoke,
+        // blood, sparks, bubbles) are drawn at the neutral shade, the plain
+        // texture, as the original game draws them (SHADE_NEUTRAL, 0x1000)
+        float fAmbient = TR::Entity::isPickup(type) ? (intensity < 0.0f ? intensityf(getRoom().ambient) : intensity) : intensityf(0x1000);
         float fAlpha   = (type == TR::Entity::SMOKE || type == TR::Entity::WATER_SPLASH || type == TR::Entity::SPARKLES) ? 0.75f : 1.0f;
 
         uint8 ambient = clamp(int(fAmbient * 255.0f), 0, 255);
@@ -1475,6 +1477,17 @@ struct Controller {
         // the last sprite may also have changed the bound tile.
         {
             MeshBuilder *m = game->getMesh();
+            // Adding this sprite can draw the ones already queued right here,
+            // in the light, palette and lamps of the last model drawn (another
+            // room, water or not): splashes flickered between dark and tinted.
+            // Each time, the queue gets the sprites' own setting, the one the
+            // end of the queue gets (Level::renderEntitiesTransp).
+            if (m->dynICount) {
+                Controller *lara = game->getLara();
+                Core::lightPos[0]   = vec4(0, 0, 0, 0);
+                Core::lightColor[0] = vec4(0, 0, 0, 1);
+                game->setRoomParams(lara ? lara->getRoomIndex() : getRoomIndex(), Shader::SPRITE, 1.0f, 1.0f, 0.0f, 1.0f, m->transparent == 1);
+            }
             Core::mModel.identity();
             Core::mModel.setPos(Core::viewPos.xyz());
             if (m->dynICount && m->curTile != 0xFFFF) {
