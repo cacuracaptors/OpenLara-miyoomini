@@ -2073,6 +2073,44 @@ struct Level : IGame {
         return s;
     }
 
+#ifdef _GAPI_SW
+    // The original game draws a room seen through a doorway on the whole
+    // screen: the doorway's rectangle only decides what is drawn at all. Only
+    // rooms that share space with another one (the levels' "impossible"
+    // places) are cut to it, so that the wrong one does not show through (as
+    // TRX does it). Cutting every room to its doorway cut off the parts of the
+    // plants and rocks standing in it that reached past the rectangle: they came
+    // and went as the camera turned.
+    bool roomOverlapsSW(int index) {
+        static const TR::Room *cached = NULL;
+        static int   count = 0;
+        static uint8 *map  = NULL;
+        if (cached != level.rooms || count != level.roomsCount) {
+            delete[] map;
+            count  = level.roomsCount;
+            cached = level.rooms;
+            map    = new uint8[count > 0 ? count : 1];
+            memset(map, 0, count > 0 ? count : 1);
+            for (int i = 0; i < count; i++) {
+                const TR::Room &a = level.rooms[i];
+                for (int j = i + 1; j < count; j++) {
+                    if (map[i] && map[j]) continue;
+                    const TR::Room &b = level.rooms[j];
+                    if (a.alternateRoom == j || b.alternateRoom == i) continue;   // a room and its flipped self
+                    // inside the walls (the outer ring of sectors is the neighbour's)
+                    const int32 ax0 = a.info.x + 1024, ax1 = a.info.x + a.xSectors * 1024 - 1024;
+                    const int32 az0 = a.info.z + 1024, az1 = a.info.z + a.zSectors * 1024 - 1024;
+                    const int32 bx0 = b.info.x + 1024, bx1 = b.info.x + b.xSectors * 1024 - 1024;
+                    const int32 bz0 = b.info.z + 1024, bz1 = b.info.z + b.zSectors * 1024 - 1024;
+                    if (ax0 < bx1 && ax1 > bx0 && a.info.yTop < b.info.yBottom && a.info.yBottom > b.info.yTop && az0 < bz1 && az1 > bz0)
+                        map[i] = map[j] = 1;
+                }
+            }
+        }
+        return index >= 0 && index < count && map[index];
+    }
+#endif
+
     void renderRooms(RoomDesc *roomsList, int roomsCount, int transp) {
         PROFILE_MARKER("ROOMS");
 
@@ -2113,7 +2151,11 @@ struct Level : IGame {
                 continue;
             }
 
+        #ifdef _GAPI_SW
+            Core::setScissor(roomOverlapsSW(roomIndex) ? getPortalRect(roomsList[i].portal, vp) : vp);
+        #else
             Core::setScissor(getPortalRect(roomsList[i].portal, vp));
+        #endif
 
             const TR::Room &room = level.rooms[roomIndex];
 
@@ -2155,7 +2197,11 @@ struct Level : IGame {
                 if (!range.sprites.iCount)
                     continue;
 
+            #ifdef _GAPI_SW
+                Core::setScissor(roomOverlapsSW(roomIndex) ? getPortalRect(roomsList[i].portal, vp) : vp);
+            #else
                 Core::setScissor(getPortalRect(roomsList[i].portal, vp));
+            #endif
 
                 setRoomParams(roomIndex, Shader::SPRITE, 1.0f, 1.0f, 0.0f, 1.0f, true);
 

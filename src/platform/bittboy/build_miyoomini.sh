@@ -17,7 +17,7 @@ arm-linux-gnueabihf-g++ \
   -I../../ -I/root/workspace/sdl2-miyoo/mini/inc \
   -o ../../../bin/OpenLara-sw-debug \
   -L$SYSROOT/usr/lib -L/root/workspace/sdl2-miyoo/mini/lib \
-  -lm -lpthread -lSDL -lmi_ao -lmi_sys -lmi_common \
+  -lm -lpthread -ldl -lSDL -lmi_ao -lmi_sys -lmi_common \
   -Wl,--allow-shlib-undefined || exit 1
 
 # Same code, symbols stripped: small to copy over the slow Wi-Fi, and the

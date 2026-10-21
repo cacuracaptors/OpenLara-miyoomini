@@ -426,6 +426,7 @@ static void miyooUpdateShared() {
 
 static int               fbFd    = -1;
 static fb_var_screeninfo fbVar;
+static unsigned long     fbPhysStart = 0;
 static uint8            *fbMem   = NULL;
 static int               fbPage  = 0;      // the page on screen
 static bool              fbVsync = false;
@@ -453,6 +454,7 @@ static void fbInit() {
     void *mem = mmap(NULL, fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fbFd, 0);
     if (mem == MAP_FAILED) { fprintf(stderr, "vsync: off (mmap failed)\n"); return; }
     fbMem   = (uint8*)mem;
+    fbPhysStart = fix.smem_start;
     fbPage  = (fbVar.yoffset >= (unsigned)SCREEN_HEIGHT) ? 1 : 0;
     fbVsync = true;
     fallout::crashHook = fbRestore;
@@ -493,6 +495,163 @@ static void fbInit() {
 // framebuffer is uncached memory. Do it on a thread of its own, so it overlaps
 // with the next frame's input, game update and vertex work; the main thread
 // only waits for it right before it overwrites the surface again.
+// ---- Reduced resolution: the chip's 2D engine scales the picture up ---------
+// With res.txt in the game folder (a width, e.g. 512), frames of play are drawn
+// at that size (3/4 of it high) into memory the 2D engine (MI_GFX) reads, and
+// the engine scales them, smoothing, into the screen page as each is shown, on
+// the flip thread: the cores do none of it. A test blit at startup checks the
+// result; anything wrong, missing libraries or memory, and every frame stays
+// at 640x480 as always.
+#if __has_include(<mi_gfx.h>)
+#include <mi_gfx.h>
+#include <dlfcn.h>
+#define HAVE_MI_GFX 1
+#endif
+
+static unsigned long fbPhys = 0;       // the screen pages' physical address
+static long long     resBlitUs = 0;    // MEASUREMENT: the engine's time per perf line
+static int           resBlits = 0;
+
+#ifdef HAVE_MI_GFX
+static struct {
+    MI_S32 (*SysInit)(void);
+    MI_S32 (*MmaAlloc)(MI_U8 *, MI_U32, MI_PHY *);
+    MI_S32 (*MmaFree)(MI_PHY);
+    MI_S32 (*Mmap)(MI_U64, MI_U32, void **, MI_BOOL);
+    MI_S32 (*Munmap)(void *, MI_U32);
+    MI_S32 (*Flush)(void *, MI_U32);
+    MI_S32 (*GfxOpen)(void);
+    MI_S32 (*GfxClose)(void);
+    MI_S32 (*Blit)(MI_GFX_Surface_t *, MI_GFX_Rect_t *, MI_GFX_Surface_t *, MI_GFX_Rect_t *, MI_GFX_Opt_t *, MI_U16 *);
+    MI_S32 (*Wait)(MI_BOOL, MI_U16);
+} mi;
+static MI_PHY resPhys[2] = { 0, 0 };
+static const size_t RES_BYTES = size_t(SCREEN_WIDTH) * SCREEN_HEIGHT * 4;
+
+static void *resOpenLib(const char *name) {
+    static const char *dirs[] = { "", "/customer/lib/", "/config/lib/", "/lib/", "/usr/lib/" };
+    char path[96];
+    for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(path, sizeof(path), "%s%s", dirs[i], name);
+        void *h = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+        if (h) return h;
+    }
+    return NULL;
+}
+
+// src (sw x sh) scaled into dst (dw x dh), both 32-bit, waiting for the engine
+static int resBlit(MI_PHY src, int sw, int sh, MI_PHY dst, int dw, int dh) {
+    MI_GFX_Surface_t s = { src, E_MI_GFX_FMT_ARGB8888, (MI_U32)sw, (MI_U32)sh, (MI_U32)sw * 4 };
+    MI_GFX_Surface_t d = { dst, E_MI_GFX_FMT_ARGB8888, (MI_U32)dw, (MI_U32)dh, (MI_U32)dw * 4 };
+    MI_GFX_Rect_t sr = { 0, 0, (MI_U32)sw, (MI_U32)sh }, dr = { 0, 0, (MI_U32)dw, (MI_U32)dh };
+    MI_GFX_Opt_t opt;
+    memset(&opt, 0, sizeof(opt));
+    opt.stClipRect   = dr;
+    opt.eSrcDfbBldOp = E_MI_GFX_DFB_BLD_ONE;
+    opt.eDstDfbBldOp = E_MI_GFX_DFB_BLD_ZERO;
+    opt.eMirror      = E_MI_GFX_MIRROR_NONE;
+    opt.eRotate      = E_MI_GFX_ROTATE_0;
+    opt.eDFBBlendFlag = E_MI_GFX_DFB_BLEND_NOFX;
+    MI_U16 fence = 0;
+    if (mi.Blit(&s, &sr, &d, &dr, &opt, &fence) != 0) return -1;
+    mi.Wait(TRUE, fence);
+    return 0;
+}
+
+static void resInit() {
+    if (!fbDirect || !fbPhys) return;
+    // res.txt (for tests): 640 turns it off, another width fixes the size;
+    // without it, the size follows how heavy each moment is
+    int w = 0;
+    FILE *f = fopen("res.txt", "r");
+    if (f) {
+        if (fscanf(f, "%d", &w) != 1) w = 0;
+        fclose(f);
+        w &= ~7;
+        if (w >= SCREEN_WIDTH) { fprintf(stderr, "res: res.txt pede 640x480 fixos\n"); return; }
+        if (w < 160) { fprintf(stderr, "res: res.txt sem uma largura valida (160 a 632), resolucao dinamica\n"); w = 0; }
+    }
+    const int h = ((w * 3 / 4) + 1) & ~1;
+    void *hs = resOpenLib("libmi_sys.so"), *hg = resOpenLib("libmi_gfx.so");
+    if (!hs || !hg) { fprintf(stderr, "res: bibliotecas do MI_GFX nao encontradas, 640x480\n"); return; }
+    *(void**)&mi.SysInit  = dlsym(hs, "MI_SYS_Init");
+    *(void**)&mi.MmaAlloc = dlsym(hs, "MI_SYS_MMA_Alloc");
+    *(void**)&mi.MmaFree  = dlsym(hs, "MI_SYS_MMA_Free");
+    *(void**)&mi.Mmap     = dlsym(hs, "MI_SYS_Mmap");
+    *(void**)&mi.Munmap   = dlsym(hs, "MI_SYS_Munmap");
+    *(void**)&mi.Flush    = dlsym(hs, "MI_SYS_FlushInvCache");
+    *(void**)&mi.GfxOpen  = dlsym(hg, "MI_GFX_Open");
+    *(void**)&mi.GfxClose = dlsym(hg, "MI_GFX_Close");
+    *(void**)&mi.Blit     = dlsym(hg, "MI_GFX_BitBlit");
+    *(void**)&mi.Wait     = dlsym(hg, "MI_GFX_WaitAllDone");
+    if (!mi.SysInit || !mi.MmaAlloc || !mi.MmaFree || !mi.Mmap || !mi.Munmap || !mi.Flush || !mi.GfxOpen || !mi.Blit || !mi.Wait) {
+        fprintf(stderr, "res: funcoes do MI_GFX nao encontradas, 640x480\n");
+        return;
+    }
+    mi.SysInit();
+    mi.GfxOpen();
+    void *virt[2] = { NULL, NULL };
+    for (int i = 0; i < 2; i++) {
+        if (mi.MmaAlloc(NULL, MI_U32(RES_BYTES), &resPhys[i]) || mi.Mmap(resPhys[i], MI_U32(RES_BYTES), &virt[i], TRUE)) {
+            fprintf(stderr, "res: sem memoria MMA, 640x480\n");
+            for (int k = 0; k <= i; k++) if (resPhys[k]) mi.MmaFree(resPhys[k]);
+            resPhys[0] = resPhys[1] = 0;
+            return;
+        }
+    }
+    // the test: 16x12 colours scaled to 32x24, from buffer 0 into buffer 1
+    uint32 *src = (uint32*)virt[0], *dst = (uint32*)virt[1];
+    for (int i = 0; i < 16 * 12; i++) src[i] = 0xFF000000u | uint32((i * 37) & 255) << 16 | uint32((i * 91) & 255) << 8 | uint32((i * 53 + 7) & 255);
+    memset(dst, 0, 32 * 24 * 4);
+    mi.Flush(virt[0], 16 * 12 * 4);
+    mi.Flush(virt[1], 32 * 24 * 4);
+    bool ok = resBlit(resPhys[0], 16, 12, resPhys[1], 32, 24) == 0;
+    mi.Flush(virt[1], 32 * 24 * 4);
+    int bad = 0;
+    if (ok) {   // the corners keep their colour (smoothing or not), and every pixel was written
+        const int cs[4] = { 0, 15, 16 * 11, 16 * 12 - 1 }, cd[4] = { 0, 31, 32 * 23, 32 * 24 - 1 };
+        for (int k = 0; k < 4; k++)
+            for (int ch = 0; ch < 24; ch += 8) {
+                const int a = int((src[cs[k]] >> ch) & 255), b = int((dst[cd[k]] >> ch) & 255);
+                if (a - b > 12 || b - a > 12) bad++;
+            }
+        for (int i = 0; i < 32 * 24; i++) if (dst[i] == 0) bad++;
+    }
+    if (!ok || bad) {
+        fprintf(stderr, "res: o teste do MI_GFX falhou (%s, %d erros), 640x480\n", ok ? "imagem errada" : "copia recusada", bad);
+        for (int i = 0; i < 2; i++) { mi.Munmap(virt[i], MI_U32(RES_BYTES)); mi.MmaFree(resPhys[i]); }
+        resPhys[0] = resPhys[1] = 0;
+        return;
+    }
+    GAPI::swLowBufs[0] = (GAPI::ColorSW*)virt[0];
+    GAPI::swLowBufs[1] = (GAPI::ColorSW*)virt[1];
+    GAPI::swUpscaleByPlatform = true;
+    if (w) {
+        GAPI::swResW = w;
+        GAPI::swResH = h;
+        fprintf(stderr, "res: jogo em %dx%d fixos (res.txt), ampliado pelo MI_GFX para %dx%d\n", w, h, SCREEN_WIDTH, SCREEN_HEIGHT);
+    } else {
+        GAPI::swResDynamic = true;
+        fprintf(stderr, "res: resolucao dinamica (640x480, 576x432 ou 512x384 conforme o peso), ampliada pelo MI_GFX\n");
+    }
+}
+
+// the small picture into the page about to be shown
+static void resUpscale(const GAPI::ColorSW *low, int w, int h, int page) {
+    const int k = (low == GAPI::swLowBufs[0]) ? 0 : 1;
+    const long long t0 = GAPI::swPerfNow();
+    mi.Flush((void*)low, MI_U32(size_t(w) * h * 4));
+    resBlit(resPhys[k], w, h, MI_PHY(fbPhys) + MI_PHY(page) * RES_BYTES, SCREEN_WIDTH, SCREEN_HEIGHT);
+    resBlitUs += GAPI::swPerfNow() - t0;
+    resBlits++;
+}
+#else
+static void resInit() {
+    if (access("res.txt", F_OK) == 0) fprintf(stderr, "res: compilado sem o MI_GFX (mi_gfx.h), 640x480\n");
+}
+static void resUpscale(const GAPI::ColorSW *low, int w, int h, int page) {}
+#endif
+
 static pthread_t       flipThread;
 static pthread_mutex_t flipMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  flipCond  = PTHREAD_COND_INITIALIZER;
@@ -500,6 +659,8 @@ static bool            flipPending = false;
 static bool            flipStarted = false;
 static SDL_Surface    *flipScreen  = NULL;
 static const GAPI::ColorSW *flipSrc = NULL;
+static const GAPI::ColorSW *flipLow = NULL;   // drawn smaller: scaled into the page first
+static int flipLowW = 0, flipLowH = 0;
 
 
 static void* flipProc(void *arg) {
@@ -515,6 +676,7 @@ static void* flipProc(void *arg) {
             int page;
             if (fbDirect) {                     // already drawn in a screen page: just show it
                 page = int(((const uint8*)src - fbMem) / pageBytes);
+                if (flipLow) resUpscale(flipLow, flipLowW, flipLowH, page);
             } else {                            // into the hidden page
                 page = fbPage ^ 1;
                 memcpy(fbMem + page * pageBytes, src, pageBytes);
@@ -558,6 +720,9 @@ static void flipStart(const GAPI::ColorSW *buffer) {
     }
     pthread_mutex_lock(&flipMutex);
     flipSrc     = buffer;
+    flipLow     = GAPI::swPresentLow;
+    flipLowW    = GAPI::swPresentLowW;
+    flipLowH    = GAPI::swPresentLowH;
     flipPending = true;
     pthread_cond_broadcast(&flipCond);
     pthread_mutex_unlock(&flipMutex);
@@ -606,6 +771,8 @@ int main() {
     }
     flipScreen      = screen;
     fbInit();     // vsync through the framebuffer's pages, if the panel allows
+    fbPhys = fbPhysStart;
+    resInit();    // res.txt: frames of play at a smaller size, scaled up by the 2D engine
     GAPI::swPresent = presentFrame;
     swBuffer = new uint16[SCREEN_WIDTH * SCREEN_HEIGHT];
 

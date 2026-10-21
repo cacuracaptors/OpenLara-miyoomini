@@ -688,6 +688,8 @@ namespace GAPI {
         bool         sky;                                  // triangles: the sky, at "infinite" depth
         bool         shadow;                               // triangles: darken instead of texturing
         short4       clip;
+        short4       clipFull;                             // the clip at full size (clip may be scaled)
+        const uint32 *clear;                               // triangles: the page's see-through blocks (tiled)
         int          triStart, triCount;
         int          sx0, sy0, sw, sh, ox0, oy0, ow, oh;   // blit
     };
@@ -709,7 +711,12 @@ namespace GAPI {
         bool      overflow;
         bool      snapshot;              // keeps the menu background (SW_CMD_SNAPSHOT)
         ColorSW  *buffer;
-        ColorSW  *colorEnd;
+        ColorSW  *colorEnd;              // the end of where it is drawn (target)
+        ColorSW  *target;                // the screen page, or the small picture
+        int       W, H;                  // the size it is drawn at
+        bool      low;                   // drawn smaller, scaled up when shown
+        bool      ui;                    // has menus (blits, the menu picture)
+        int       lowLevel;              // the dynamic resolution's step it was started at
         uint8     owner[SW_GROUPS];      // 1: the worker core draws this group
         uint8     lightSel[32 * 256];
         ColorSW   palWorld[256];         // scene palette
@@ -753,7 +760,9 @@ namespace GAPI {
             f.verts = new VertexSW[SW_MAX_VERTS];
             f.cmdCount = f.triCount = f.vertCount = 0;
             f.overflow = false;
-            f.buffer = f.colorEnd = NULL;
+            f.buffer = f.colorEnd = f.target = NULL;
+            f.W = Core::width; f.H = Core::height;
+            f.low = f.ui = false;
         }
         swRec = &swFrames[0];
     }
@@ -768,6 +777,11 @@ namespace GAPI {
         int          count;
     };
     TiledPagesSW swTiled = { NULL, NULL, 0 };
+    // For each tiled page, its 8x8 blocks with no texel at all (every index 0,
+    // see-through): bit bu of row bv. Leaves and fences are mostly holes; a
+    // stretch whose texels all lie in such blocks paints nothing and is
+    // skipped whole, before its pixels (the very same picture).
+    uint32 *swTiledClear = NULL;
 
     // always inside the 256x256 page (a coordinate one step off the edge wraps,
     // as the plain rows' "+ (u >> 16)" stays near it)
@@ -799,6 +813,22 @@ namespace GAPI {
                 for (int tu = 0; tu < 256; tu++)
                     dst[tiledIndexSW(tu, tv)] = src[(tv << 8) + tu];
         }
+        delete[] swTiledClear;
+        swTiledClear = new uint32[count * 32];
+        for (int i = 0; i < count; i++) {
+            const uint8 *src = tiles[i].index;
+            for (int bv = 0; bv < 32; bv++) {
+                uint32 row = 0;
+                for (int bu = 0; bu < 32; bu++) {
+                    bool clear = true;
+                    for (int y = 0; y < 8 && clear; y++)
+                        for (int x = 0; x < 8; x++)
+                            if (src[((bv * 8 + y) << 8) + bu * 8 + x]) { clear = false; break; }
+                    if (clear) row |= 1u << bu;
+                }
+                swTiledClear[i * 32 + bv] = row;
+            }
+        }
     }
 
     void swUnregisterTiles(const Tile8 *tiles) {
@@ -808,6 +838,8 @@ namespace GAPI {
         swTiled.orig  = NULL;
         swTiled.tiled = NULL;
         swTiled.count = 0;
+        delete[] swTiledClear;
+        swTiledClear  = NULL;
     }
 
     struct RasterCtxSW {
@@ -818,11 +850,13 @@ namespace GAPI {
         Texture       *tex;
         const ColorSW *pal;      // scene palette for this batch (dry or underwater)
         const ColorSW *lit;      // the same at each light level
+        const uint32  *clear;    // the page's see-through 8x8 blocks (tiled pages)
         bool           affine, ortho, testZ, writeZ;
         bool           tiled;
         bool           shadow;
         bool           sky;
         short4         clip;
+        int            W;        // row length of what is drawn into
         int            band;     // 0: main core, 1: worker core
         long long      pixels;
     };
@@ -842,7 +876,7 @@ namespace GAPI {
         float fv = pV.dx * xc + pV.dy * yc + pV.c;
         float fl = pL.dx * xc + pL.dy * yc + pL.c;
 
-        ColorSW *color = ctx.colorEnd - y * Core::width;   // mirrored row: pixel x at color[-x]
+        ColorSW *color = ctx.colorEnd - y * ctx.W;   // mirrored row: pixel x at color[-x]
         const uint8   *texels   = ctx.texels;
         const uint8   *lightSel = ctx.frame->lightSel;
         const ColorSW *palUI    = ctx.frame->palUI;
@@ -953,23 +987,28 @@ namespace GAPI {
     #define SW_HIZ_LAZY  4
     static const int swHiZOn = SW_HIZ_FACES | SW_HIZ_LAZY;
 
-    static inline void swHiZInit() {
-        const int w = (Core::width + 7) >> 3, h = (Core::height + 7) >> 3;
-        if (swHiZ && w == swHiZW && h == swHiZH) return;
-        delete[] swHiZ;
-        delete[] swHiZDirty;
-        swHiZW = w; swHiZH = h;
-        swHiZ      = new uint16[w * h];
-        swHiZDirty = new uint8[w * h];
-        memset(swHiZ, 0, w * h * sizeof(uint16));      // nothing known: nothing is hidden
-        memset(swHiZDirty, 0, w * h);
+    int swHiZPW = 0, swHiZPH = 0, swHiZCap = 0;
+    static inline void swHiZInit(int PW, int PH) {
+        const int w = (PW + 7) >> 3, h = (PH + 7) >> 3;
+        const int cap = ((Core::width + 7) >> 3) * ((Core::height + 7) >> 3);
+        if (swHiZ && w == swHiZW && h == swHiZH && swHiZCap >= cap) return;
+        if (!swHiZ || swHiZCap < cap) {
+            delete[] swHiZ;
+            delete[] swHiZDirty;
+            swHiZ      = new uint16[cap];
+            swHiZDirty = new uint8[cap];
+            swHiZCap   = cap;
+        }
+        swHiZW = w; swHiZH = h; swHiZPW = PW; swHiZPH = PH;
+        memset(swHiZ, 0, cap * sizeof(uint16));        // nothing known: nothing is hidden
+        memset(swHiZDirty, 0, cap);
     }
 
     // the farthest depth in block (bx, by)
     static inline int32 swHiZGet(int bx, int by) {
         const int i = by * swHiZW + bx;
         if (swHiZDirty[i]) {
-            const int W = Core::width, H = Core::height;
+            const int W = swHiZPW, H = swHiZPH;
             const int x0 = bx << 3, y0 = by << 3;
             const int w  = W - x0 < 8 ? W - x0 : 8;
             const int h  = H - y0 < 8 ? H - y0 : 8;
@@ -1106,7 +1145,7 @@ namespace GAPI {
     // multiply blend the GPU renderers use.
     static void drawShadowSpanSW(RasterCtxSW &ctx, int y, int x0, int x1, const PlaneSW &pQ) {
         ctx.pixels += x1 - x0;
-        const int32 row   = y * Core::width;
+        const int32 row   = y * ctx.W;
         ColorSW    *color = ctx.colorEnd - row;     // mirrored: pixel x at color[-x]
         DepthSW    *depth = swDepth ? swDepth + row : NULL;
         float       pq    = pQ.dx * (float(x0) + 0.5f) + pQ.dy * (float(y) + 0.5f) + pQ.c;
@@ -1137,7 +1176,7 @@ namespace GAPI {
         float l  = pL.dx * xc + pL.dy * yc + pL.c;
         if (ctx.writeZ && swHiZ && swDepth) swHiZMark(y, x0, x1);
 
-        const int32    row      = y * Core::width;
+        const int32    row      = y * ctx.W;
         ColorSW       *color    = ctx.colorEnd - row;     // mirrored: pixel x at color[-x]
         DepthSW       *depth    = swDepth ? swDepth + row : NULL;
         const bool     testZ    = depth && ctx.testZ;
@@ -1148,6 +1187,7 @@ namespace GAPI {
         const uint8   *lightSel = ctx.frame->lightSel;
         const ColorSW *palWorld = ctx.pal;
         const ColorSW *lit      = ctx.lit;
+        const uint32  *clearBlocks = (ctx.tiled && !ctx.affine) ? ctx.clear : NULL;
         const bool     fast     = tiled && swSpanFast && lit;
         const int32    UV_MAX   = (256 << 16) - 1;
         const int32    LV_MAX   = (32 << 19) - 1;
@@ -1270,6 +1310,33 @@ namespace GAPI {
             if (vb < 0) vb = 0; else if (vb > UV_MAX) vb = UV_MAX;
             int32 lvB = int32(l1);
             if (lvB < 0) lvB = 0; else if (lvB > LV_MAX) lvB = LV_MAX;
+            if (clearBlocks) {
+                // its texels lie between the ends (the steps go straight from one to the other)
+                const int bu0 = (ua < ub ? ua : ub) >> 19, bu1 = (ua < ub ? ub : ua) >> 19;
+                const int bv0 = (va < vb ? va : vb) >> 19, bv1 = (va < vb ? vb : va) >> 19;
+                if (bu1 - bu0 < 4 && bv1 - bv0 < 4) {
+                    const uint32 want = ((2u << (bu1 - bu0)) - 1) << bu0;
+                    int bv = bv0;
+                    while (bv <= bv1 && (clearBlocks[bv] & want) == want) bv++;
+                    if (bv > bv1) {             // nothing to paint
+                        if (!setup2) {
+                            zB = int32(pq1 * 536870912.0f);
+                            if (zB < 0) zB = 0; else if (zB > Z_MAX) zB = Z_MAX;
+                        }
+                        x  += len;
+                        pu  = pu1;
+                        pv  = pv1;
+                        pq  = pq1;
+                        l   = l1;
+                        ua  = ub;
+                        va  = vb;
+                        lvA = lvB;
+                        zA  = zB;
+                        codeA = codeB;
+                        continue;
+                    }
+                }
+            }
             if (!setup2) {
                 zB = int32(pq1 * 536870912.0f);
                 if (zB < 0) zB = 0; else if (zB > Z_MAX) zB = Z_MAX;
@@ -1557,9 +1624,116 @@ namespace GAPI {
     }
 
     // ---- recording (main core) ----
+    // ---- Reduced resolution (gameplay frames) -------------------------------
+    // A frame of play can be drawn smaller (swResW x swResH) into a buffer of
+    // its own, and the platform scales it up into the screen page (the chip's
+    // 2D engine, with smoothing) as it shows it. Frames with menus, the
+    // inventory's background or videos (blits, the kept menu picture) always
+    // stay at full size: a frame that turns out to have one goes back to full
+    // size before it is drawn, and the frame after it starts at full size too.
+    int      swResW = 0, swResH = 0;           // 0: always full size
+    ColorSW *swLowBufs[2] = { NULL, NULL };    // one for each frame in flight (the platform gives them)
+    bool     swUpscaleByPlatform = false;      // the platform scales in its present; otherwise done here
+    const ColorSW *swPresentLow = NULL;        // for the platform's present: this frame's small picture
+    int      swPresentLowW = 0, swPresentLowH = 0;
+    int      swLowFrames = 0;                  // MEASUREMENT: frames drawn smaller
+    static bool swPrevUI = true;               // the last frame had menus: this one at full size
+
+    // ---- Dynamic resolution ----------------------------------------------------
+    // Each frame, how long the cores worked on it (the main core: the game, the
+    // recording and its share of the drawing; the other: its share): over a
+    // 60 Hz frame and the next frames are drawn a step smaller (576x432, then
+    // 512x384); with room to spare for a while, a step bigger, back to 640x480.
+    // Only frames of play: menus stay at full size.
+    bool swResDynamic = false;                 // the platform turns it on (the 2D engine works)
+    int  swResLevel   = 0;                     // 0: 640x480, 1: 576x432, 2: 512x384
+    static const int SW_RES_W[3] = { 0, 576, 512 }, SW_RES_H[3] = { 0, 432, 384 };
+    static int swResSlow = 0, swResFast = 0;
+    int  swResLevelFrames[3] = { 0, 0, 0 };    // MEASUREMENT: frames at each size
+
+    static void swResChoose(const FrameSW &f, long long costUs) {
+        if (!swResDynamic) return;
+        if (!f.ui) swResLevelFrames[f.low ? swResLevel : 0]++;
+        if (f.ui) return;                      // menus: no say in it
+    #ifndef SW_RES_BUDGET
+    #define SW_RES_BUDGET 16200                // a 60 Hz frame, a little to spare (us)
+    #endif
+        const long long BUDGET = SW_RES_BUDGET;
+        if (costUs > BUDGET) { swResSlow++; swResFast = 0; } else swResSlow = 0;
+        if (swResLevel < 2 && (swResSlow >= 2 || costUs > BUDGET + 2500)) {
+            swResLevel++; swResSlow = 0; swResFast = 0;
+        } else if (swResLevel > 0) {
+            // what this frame would have cost a step bigger (the drawing grows with the pixels)
+            const double up = swResLevel == 2 ? (576.0 * 432.0) / (512.0 * 384.0) : (640.0 * 480.0) / (576.0 * 432.0);
+            if (double(costUs) * up < double(BUDGET) * 0.9) {
+                if (++swResFast >= 45) { swResLevel--; swResFast = 0; }
+            } else swResFast = 0;
+        }
+        swResW = SW_RES_W[swResLevel];
+        swResH = SW_RES_H[swResLevel];
+    }
+
+    static void swFrameStartSW(FrameSW &f) {
+        const bool can = swResW > 0 && swResH > 0 && swResW < Core::width && swResH < Core::height
+                      && swLowBufs[0] && swLowBufs[1];
+        f.lowLevel = swResLevel;
+        f.low = can && !swPrevUI;
+        f.W   = f.low ? swResW : Core::width;
+        f.H   = f.low ? swResH : Core::height;
+    }
+
+    static inline short4 swScaleClipSW(const short4 &c, const FrameSW &f) {
+        short4 r;
+        r.x = short((c.x * f.W) / Core::width);
+        r.z = short((c.z * f.W + Core::width - 1) / Core::width);
+        r.y = short((c.y * f.H) / Core::height);
+        r.w = short((c.w * f.H + Core::height - 1) / Core::height);
+        if (r.z > f.W) r.z = short(f.W);
+        if (r.w > f.H) r.w = short(f.H);
+        return r;
+    }
+
+    static inline void swScaleVertSW(VertexSW &v, float sx, float sy) {
+        v.fx *= sx;
+        v.fy *= sy;
+        v.x  = int32(v.fx * 65536.0f);
+        v.y  = int32(floorf(v.fy + 0.5f));
+    }
+
+    // a frame recorded smaller that turns out to have menus: back to full size
+    static void swFrameToFullSW(FrameSW &f) {
+        if (!f.low) return;
+        const float sx = float(Core::width) / float(f.W), sy = float(Core::height) / float(f.H);
+        for (int i = 0; i < f.vertCount; i++) swScaleVertSW(f.verts[i], sx, sy);
+        for (int i = 0; i < f.cmdCount; i++)
+            if (f.cmds[i].type == SW_CMD_TRIS) f.cmds[i].clip = f.cmds[i].clipFull;
+        f.low = false;
+        f.W   = Core::width;
+        f.H   = Core::height;
+    }
+
+    static void swMarkUISW() {
+        swInitFrames();
+        FrameSW &f = *swRec;
+        if (f.cmdCount == 0) swFrameStartSW(f);
+        f.ui = true;
+        swFrameToFullSW(f);
+    }
+
+    // without the platform: scaled here, nearest pixel (the simulator)
+    static void swUpscaleCPU(const FrameSW &f) {
+        const int W = Core::width, H = Core::height;
+        for (int y = 0; y < H; y++) {
+            const ColorSW *s = f.target + ((y * f.H) / H) * f.W;
+            ColorSW *d = f.buffer + y * W;
+            for (int x = 0; x < W; x++) d[x] = s[(x * f.W) / W];
+        }
+    }
+
     static inline CmdSW* swNewCmd() {
         swInitFrames();
         FrameSW &f = *swRec;
+        if (f.cmdCount == 0) swFrameStartSW(f);
         if (f.cmdCount >= SW_MAX_CMDS) {
             f.overflow = true;
             return NULL;
@@ -1575,6 +1749,7 @@ namespace GAPI {
     bool     swMenuBgReady = false;
 
     void swRecordSnapshot() {
+        swMarkUISW();
         CmdSW *cmd = swNewCmd();
         if (!cmd) return;
         cmd->type = SW_CMD_SNAPSHOT;
@@ -1587,6 +1762,7 @@ namespace GAPI {
     }
 
     void swRecordRestore() {
+        swMarkUISW();
         CmdSW *cmd = swNewCmd();
         if (!cmd) return;
         cmd->type = SW_CMD_RESTORE;
@@ -1607,6 +1783,7 @@ namespace GAPI {
 
     void swRecordBlit(Texture *tex, int sx0, int sy0, int sw, int sh, int ox0, int oy0, int ow, int oh) {
         swInitFrames();
+        swMarkUISW();
         {   // a blit rewrites every row of the color buffer: earlier color work is lost
             FrameSW &f = *swRec;
             for (int i = 0; i < f.cmdCount; i++) {
@@ -1644,6 +1821,7 @@ namespace GAPI {
     void swBeginBatch(bool ortho, int maxTris) {
         swInitFrames();
         FrameSW &f = *swRec;
+        if (f.cmdCount == 0) swFrameStartSW(f);
         const int n = swVertices.length;
         swBatch = NULL;
         if (f.vertCount + n > SW_MAX_VERTS || f.triCount + maxTris > SW_MAX_TRIS || f.cmdCount >= SW_MAX_CMDS) {
@@ -1653,12 +1831,18 @@ namespace GAPI {
         memcpy(f.verts + f.vertCount, swVertices.items, n * sizeof(VertexSW));
         swBatchBase  = f.verts + f.vertCount;
         f.vertCount += n;
+        if (f.low) {
+            const float sx = float(f.W) / float(Core::width), sy = float(f.H) / float(Core::height);
+            for (int i = 0; i < n; i++) swScaleVertSW(f.verts[f.vertCount - n + i], sx, sy);
+        }
 
         swBatch = &f.cmds[f.cmdCount++];
         swBatch->type     = SW_CMD_TRIS;
         const Tile8 *tt = curTile;
         bool tiled = false;
+        swBatch->clear = NULL;
         if (tt && swTiled.tiled && tt >= swTiled.orig && tt < swTiled.orig + swTiled.count) {
+            if (swTiledClear) swBatch->clear = swTiledClear + (tt - swTiled.orig) * 32;
             tt    = swTiled.tiled + (tt - swTiled.orig);
             tiled = true;
         }
@@ -1672,7 +1856,8 @@ namespace GAPI {
         swBatch->water    = swBatchWater;
         swBatch->shadow   = swShadowBatch;
         swBatch->sky      = swSkyBatch;
-        swBatch->clip     = swClipRect;
+        swBatch->clipFull = swClipRect;
+        swBatch->clip     = f.low ? swScaleClipSW(swClipRect, f) : swClipRect;
         swBatch->triStart = f.triCount;
         swBatch->triCount = 0;
     }
@@ -1807,7 +1992,8 @@ namespace GAPI {
         ctx.owner    = f.owner;
         ctx.band     = band;
         ctx.pixels   = 0;
-        const int W = Core::width, H = Core::height;
+        const int W = f.W, H = f.H;
+        ctx.W        = W;
         for (int i = 0; i < f.cmdCount; i++) {
             const CmdSW &cmd = f.cmds[i];
             if (cmd.type == SW_CMD_CLEAR) {
@@ -1855,6 +2041,7 @@ namespace GAPI {
                 ctx.clip   = cmd.clip;
                 ctx.pal    = cmd.water ? f.palWater : f.palWorld;
                 ctx.lit    = cmd.water ? f.litWater : f.litWorld;
+                ctx.clear  = cmd.tiled ? cmd.clear : NULL;
                 ctx.shadow = cmd.shadow;
                 ctx.sky    = cmd.sky;
                 const TriSW *tri = f.tris + cmd.triStart;
@@ -1900,7 +2087,9 @@ namespace GAPI {
     }
 
     static void swBuildOwner(FrameSW &f, int k) {
-        const int groups = (Core::height + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
+        const int groupsFull = (Core::height + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
+        const int groups = (f.H + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
+        if (groups != groupsFull) k = (k * groups + groupsFull / 2) / groupsFull;
         for (int g = 0; g < SW_GROUPS; g++) f.owner[g] = 0;
         for (int g = 0; g < groups && g < SW_GROUPS; g++) {   // spread the worker's groups evenly
             f.owner[g] = uint8(((g + 1) * k) / groups - (g * k) / groups);
@@ -1994,7 +2183,8 @@ namespace GAPI {
         const long long t2 = swPerfNow();
 
         // Balance: whoever finished first gets more of the next frame.
-        const int groups = (Core::height + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
+        const int groupsFull = (Core::height + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
+        const int groups = (f.H + (1 << SW_BAND_SHIFT) - 1) >> SW_BAND_SHIFT;
         const long long mainWait   = t2 - t1;          // main idle, waiting for the worker
         const long long workerIdle = t1 - workerEnd;   // worker done before the main core
         {
@@ -2007,6 +2197,7 @@ namespace GAPI {
                 double target = (rec / cost + groups) * 0.5;
                 if (target < 2) target = 2;
                 if (target > groups) target = groups;
+                target = target * groupsFull / groups;     // kept in full-size groups
                 swWorkerGroups = int((swWorkerGroups * 3 + target) / 4.0 + 0.5);
             }
         }
@@ -2020,10 +2211,22 @@ namespace GAPI {
             f.snapshot    = false;
         }
 
+        {
+            const long long mainUs = t1 - swLaunchTime;
+            swResChoose(f, mainUs > workerBusy ? mainUs : workerBusy);
+        }
+        swPresentLow = NULL;
+        if (f.low) {
+            swLowFrames++;
+            if (swUpscaleByPlatform) { swPresentLow = f.target; swPresentLowW = f.W; swPresentLowH = f.H; }
+            else swUpscaleCPU(f);
+        }
         if (swPresent) swPresent(f.buffer);   // waits for the other buffer's copy, then starts this one
 
         f.cmdCount = f.triCount = f.vertCount = 0;
         f.overflow = false;
+        f.low = f.ui = false;
+        f.W = Core::width; f.H = Core::height;
         swPend = NULL;
     }
 
@@ -2060,10 +2263,12 @@ namespace GAPI {
             f.buffer     = swBuffers[swNextBuffer & 1];
             swNextBuffer = (swNextBuffer + 1) & 1;
         }
-        f.colorEnd = f.buffer + W * H - 1;
+        swPrevUI   = f.ui;
+        f.target   = f.low ? swLowBufs[&f == &swFrames[0] ? 0 : 1] : f.buffer;
+        f.colorEnd = f.target + f.W * f.H - 1;
 
         swBuildShadeFrame(f);
-        swHiZInit();
+        swHiZInit(f.W, f.H);
         swBuildOwner(f, swWorkerGroups);
 
         swPend = &f;

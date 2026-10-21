@@ -187,6 +187,94 @@ struct MeshBuilder {
         BLEND_ADD   = 4,
     };
 
+    // A plant or rock standing in a doorway belongs to one room: when only the
+    // room it leans into was in view, it was not drawn at all and vanished as
+    // the camera turned (as in the original game). Like TRX, a static whose
+    // box reaches a doorway, or 1/16 of a sector into the room past it, is
+    // built into that room's geometry too (turned and placed the same: the very
+    // same faces). Rooms that flip, and ones of the other kind (water or not),
+    // keep only their own.
+    struct BorrowedStatic { int16 room, mesh; };
+    BorrowedStatic *borrowed;
+    int            *borrowedStart;   // room i borrows borrowed[borrowedStart[i] .. borrowedStart[i + 1])
+
+    void findBorrowedStatics() {
+        const int n = level->roomsCount;
+        borrowedStart = new int[n + 1];
+        uint8 *flips = new uint8[n > 0 ? n : 1];
+        memset(flips, 0, n > 0 ? n : 1);
+        for (int i = 0; i < n; i++) {
+            const int a = level->rooms[i].alternateRoom;
+            if (a >= 0 && a < n) flips[i] = flips[a] = 1;
+        }
+        int cap = 64, count = 0;
+        borrowed = new BorrowedStatic[cap];
+        for (int dst = 0; dst < n; dst++) {
+            borrowedStart[dst] = count;
+            if (flips[dst]) continue;
+            const TR::Room &d = level->rooms[dst];
+            const int dx0 = d.info.x + 1024, dx1 = d.info.x + d.xSectors * 1024 - 1024;
+            const int dz0 = d.info.z + 1024, dz1 = d.info.z + d.zSectors * 1024 - 1024;
+            const int dy0 = d.info.yTop, dy1 = d.info.yBottom;
+            for (int src = 0; src < n; src++) {
+                if (src == dst || flips[src]) continue;
+                const TR::Room &r = level->rooms[src];
+                if (r.flags.water != d.flags.water) continue;
+                for (int p = 0; p < r.portalsCount; p++) {
+                    const TR::Room::Portal &portal = r.portals[p];
+                    if (portal.roomIndex != dst) continue;
+                    int px0 = 0x7FFFFFFF, px1 = -0x7FFFFFFF, py0 = 0x7FFFFFFF, py1 = -0x7FFFFFFF, pz0 = 0x7FFFFFFF, pz1 = -0x7FFFFFFF;
+                    for (int k = 0; k < 4; k++) {
+                        const int vx = r.info.x + portal.vertices[k].x, vy = portal.vertices[k].y, vz = r.info.z + portal.vertices[k].z;
+                        px0 = min(px0, vx); px1 = max(px1, vx);
+                        py0 = min(py0, vy); py1 = max(py1, vy);
+                        pz0 = min(pz0, vz); pz1 = max(pz1, vz);
+                    }
+                    for (int j = 0; j < r.meshesCount; j++) {
+                        const TR::Room::Mesh &m = r.meshes[j];
+                        TR::StaticMesh *s = &level->staticMeshes[m.meshIndex];
+                        if (!level->meshOffsets[s->mesh]) continue;
+                        ::Box box;
+                        s->getBox(false, m.rotation, box);
+                        const int bx0 = m.x + int(box.min.x), bx1 = m.x + int(box.max.x);
+                        const int by0 = m.y + int(box.min.y), by1 = m.y + int(box.max.y);
+                        const int bz0 = m.z + int(box.min.z), bz1 = m.z + int(box.max.z);
+                        bool reach;
+                        if (portal.normal.y == 0) {
+                            reach = !(bx0 > px1 || bx1 < px0 || by0 > py1 || by1 < py0 || bz0 > pz1 || bz1 < pz0);
+                        } else {
+                            reach = !(bx0 > px1 || bx1 < px0 || bz0 > pz1 || bz1 < pz0)
+                                 && (portal.normal.y > 0 ? by0 <= py0 : by1 >= py1);
+                        }
+                        if (!reach) {   // or standing well into the room past the wall
+                            const int ox = min(bx1, dx1) - max(bx0, dx0);
+                            const int oy = min(by1, dy1) - max(by0, dy0);
+                            const int oz = min(bz1, dz1) - max(bz0, dz0);
+                            reach = min(min(ox, oy), oz) >= 1024 / 16;
+                        }
+                        if (!reach) continue;
+                        bool have = false;
+                        for (int k = borrowedStart[dst]; k < count && !have; k++)
+                            have = borrowed[k].room == src && borrowed[k].mesh == j;
+                        if (have) continue;
+                        if (count == cap) {
+                            BorrowedStatic *grown = new BorrowedStatic[cap * 2];
+                            memcpy(grown, borrowed, count * sizeof(BorrowedStatic));
+                            delete[] borrowed;
+                            borrowed = grown;
+                            cap *= 2;
+                        }
+                        borrowed[count].room = int16(src);
+                        borrowed[count].mesh = int16(j);
+                        count++;
+                    }
+                }
+            }
+        }
+        borrowedStart[n] = count;
+        delete[] flips;
+    }
+
     MeshBuilder(TR::Level *level, Texture *atlas) : atlas(atlas), level(level) {
         dynMesh = new Mesh(NULL, COUNT(dynIndices), NULL, COUNT(dynVertices), 1, true);
         dynRange.vStart = 0;
@@ -227,6 +315,7 @@ struct MeshBuilder {
             level->flipMap();
         }
 
+        findBorrowedStatics();
     // get reooms geometry info
         for (int i = 0; i < level->roomsCount; i++) {
             TR::Room       &r = level->rooms[i];
@@ -245,6 +334,13 @@ struct MeshBuilder {
                 if (!level->meshOffsets[s->mesh]) continue;
                 TR::Mesh &mesh = level->meshes[level->meshOffsets[s->mesh]];
 
+                iCount += (mesh.rCount * 6 + mesh.tCount * 3) * DOUBLE_SIDED;
+                vCount += (mesh.rCount * 4 + mesh.tCount * 3);
+            }
+            for (int k = borrowedStart[i]; k < borrowedStart[i + 1]; k++) {   // the neighbours' that reach in
+                TR::Room::Mesh &m = level->rooms[borrowed[k].room].meshes[borrowed[k].mesh];
+                TR::StaticMesh *s = &level->staticMeshes[m.meshIndex];
+                TR::Mesh &mesh = level->meshes[level->meshOffsets[s->mesh]];
                 iCount += (mesh.rCount * 6 + mesh.tCount * 3) * DOUBLE_SIDED;
                 vCount += (mesh.rCount * 4 + mesh.tCount * 3);
             }
@@ -358,6 +454,16 @@ struct MeshBuilder {
                     if (!level->meshOffsets[s->mesh]) continue;
                     TR::Mesh &mesh = level->meshes[level->meshOffsets[s->mesh]];
 
+                    int x = m.x - room.info.x;
+                    int y = m.y;
+                    int z = m.z - room.info.z;
+                    int d = m.rotation.value / 0x4000;
+                    buildMesh(geom, blendMask, mesh, level, indices, vertices, iCount, vCount, vStartRoom, 0, x, y, z, d, m.color, true, false);
+                }
+                for (int k = borrowedStart[i]; k < borrowedStart[i + 1]; k++) {   // the neighbours' that reach in
+                    TR::Room::Mesh &m = level->rooms[borrowed[k].room].meshes[borrowed[k].mesh];
+                    TR::StaticMesh *s = &level->staticMeshes[m.meshIndex];
+                    TR::Mesh &mesh = level->meshes[level->meshOffsets[s->mesh]];
                     int x = m.x - room.info.x;
                     int y = m.y;
                     int z = m.z - room.info.z;
@@ -648,6 +754,8 @@ struct MeshBuilder {
     }
 
     ~MeshBuilder() {
+        delete[] borrowed;
+        delete[] borrowedStart;
         for (int i = 0; i < level->roomsCount; i++)
             for (int j = 0; j < COUNT(rooms[i].dynamic); j++)
                 delete[] rooms[i].dynamic[j].faces;
