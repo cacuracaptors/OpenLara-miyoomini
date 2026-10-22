@@ -1233,6 +1233,26 @@ namespace GAPI {
                 if (x1 - x >= 32 && !affine && fabsf(pQ.dx) * 32.0f < pq * (1.0f / 64.0f))
                     len = 32;
             }
+            // Up close, a wall or floor seen at a slant changes depth a lot
+            // within the stretch, and the straight steps between its exact ends
+            // bend the texture (warping). The error of those steps is about
+            // (texels crossed) x (change of 1/w over the stretch) / 4; where it
+            // could pass half a texel the stretch is cut to 16, 8, 4 or 2 pixels.
+            // Elsewhere it stays as long as before (the same pixels).
+            if (!affine && len > 2) {
+                const float dq  = pQ.dx;
+                const float au  = fabsf(pU.dx * pq - pu * dq);
+                const float av  = fabsf(pV.dx * pq - pv * dq);
+                const float a   = (au > av ? au : av) * fabsf(dq);
+                const float lim = (0.5f * 4.0f * 65536.0f) * pq * pq;
+                float qe = pq + dq * float(len);
+                float qm = pq < qe ? pq : qe;
+                while (len > 2 && a * float(len * len) > lim * qm) {
+                    len = len > 16 ? 16 : (len + 1) >> 1;
+                    qe = pq + dq * float(len);
+                    qm = pq < qe ? pq : qe;
+                }
+            }
 
             float pu1 = pu + pU.dx * float(len);
             float pv1 = pv + pV.dx * float(len);
@@ -1361,6 +1381,12 @@ namespace GAPI {
                 dv = div32SW(vb - va);
                 dl = div32SW(lvB - lvA);
                 dz = div32SW(zE - zS);
+            } else if (len == 8 || len == 4 || len == 2) {   // the shorter stretches up close
+                const int sh = len == 8 ? 3 : len == 4 ? 2 : 1, m = len - 1;
+                du = ((ub - ua)   + (((ub - ua)   >> 31) & m)) >> sh;
+                dv = ((vb - va)   + (((vb - va)   >> 31) & m)) >> sh;
+                dl = ((lvB - lvA) + (((lvB - lvA) >> 31) & m)) >> sh;
+                dz = ((zE - zS)   + (((zE - zS)   >> 31) & m)) >> sh;
             } else {
                 du = (ub - ua) / len;
                 dv = (vb - va) / len;
