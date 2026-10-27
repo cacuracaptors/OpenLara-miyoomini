@@ -21,7 +21,8 @@ struct SaveItem {
 };
 
 struct SaveStats {
-    uint32 level:30;
+    uint32 level:29;
+    uint32 resume:1;     // Miyoo: checkpoint left for the Game Switcher / power-off (the bit was always 0 before)
     uint32 quick:1;      // Miyoo: checkpoint made by the quick save (Menu+R1), apart from the passport's
     uint32 checkpoint:1;
     uint32 time;
@@ -107,6 +108,17 @@ struct SaveSlot {
         return isCheckpoint() && ((SaveStats*)data)->quick;
     }
 
+    // Miyoo: the Game Switcher's / power-off's own slot - the game goes on from it when OnionOS
+    // opens it again; the passport's list hides it, and it is removed once loaded
+    bool isResume() const {
+        return isCheckpoint() && ((SaveStats*)data)->resume;
+    }
+
+    // a checkpoint's kind: 0 the passport's, 1 the quick save, 2 the Game Switcher's
+    int kind() const {
+        return isResume() ? 2 : (isQuick() ? 1 : 0);
+    }
+
     static int cmp(const SaveSlot &a, const SaveSlot &b) {
         uint32 ia = *(uint32*)a.data; // level + checkpoint flag
         uint32 ib = *(uint32*)b.data;
@@ -164,7 +176,7 @@ uint8* writeSaveSlots(int &size) {
     return data;
 }
 
-// quick: -1 = every checkpoint, 0 = the passport's only, 1 = the quick save's only
+// quick: -1 = every checkpoint, 0 = the passport's only, 1 = the quick save's only, 2 = the Game Switcher's
 void removeSaveSlot(TR::LevelID levelID, bool checkpoint, int quick = -1) {
     TR::Version version = TR::getGameVersionByLevel(levelID);
 
@@ -176,7 +188,7 @@ void removeSaveSlot(TR::LevelID levelID, bool checkpoint, int quick = -1) {
         if (TR::getGameVersionByLevel(id) != version)
             continue;
 
-        if (slot.isCheckpoint() ? (quick < 0 || int(slot.isQuick()) == quick) : (!checkpoint && levelID == id)) {
+        if (slot.isCheckpoint() ? (quick < 0 || slot.kind() == quick) : (!checkpoint && levelID == id)) {
             delete[] slot.data;
             saveSlots.remove(i);
             i--;
@@ -185,7 +197,7 @@ void removeSaveSlot(TR::LevelID levelID, bool checkpoint, int quick = -1) {
     }
 }
 
-int getSaveSlot(TR::LevelID levelID, bool checkpoint, bool quick = false) {
+int getSaveSlot(TR::LevelID levelID, bool checkpoint, int quick = 0) {   // quick: the checkpoint's kind
     TR::Version version = TR::getGameVersionByLevel(levelID);
 
     for (int i = 0; i < saveSlots.length; i++) {
@@ -196,7 +208,7 @@ int getSaveSlot(TR::LevelID levelID, bool checkpoint, bool quick = false) {
         if (TR::getGameVersionByLevel(id) != version)
             continue;
 
-        if ((checkpoint && slot.isCheckpoint() && slot.isQuick() == quick) || (!checkpoint && !slot.isCheckpoint() && levelID == id))
+        if ((checkpoint && slot.isCheckpoint() && slot.kind() == quick) || (!checkpoint && !slot.isCheckpoint() && levelID == id))
             return i;
     }
 

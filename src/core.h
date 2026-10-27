@@ -459,9 +459,18 @@ namespace Core {
         return osGetTimeMS();
     }
 
+    // Miyoo Mini: the leftover of the clock for whole steps of the panel (see update)
+    float stepRest;
+    // the panel's refresh period, measured at each page flip (platform/bittboy):
+    // a little over 1/60 s (about 59.7 Hz)
+    volatile float panelPeriod = 1.0f / 60.0f;
+
     void resetTime() {
         lastTime = getTime();
         resetState = true;
+    #ifdef __MIYOO__
+        stepRest = 0.0f;
+    #endif
     }
 
     void quit() {
@@ -1133,6 +1142,30 @@ namespace Core {
             return false;
         deltaTime = (time - lastTime) * 0.001f;
         lastTime = time;
+    #ifdef __MIYOO__
+        // Each frame is shown for whole refreshes of the 60 Hz panel (vsync),
+        // but the clock counts whole milliseconds: the steps came out 16 or
+        // 17 ms, about one in four shorter than the others, while the screen
+        // shows every frame for 16.7 ms. Far away that is nothing; a wall
+        // passing right by the camera crosses the screen at over 100 pixels a
+        // frame, and the short step was a jump of several pixels. The game
+        // now steps in whole refreshes of the panel (its period as measured
+        // at the page flips: about 59.7 Hz, not exactly 60 - with 1/60 s the
+        // leftover grew and came out as a double step every few seconds), the
+        // clock's leftover kept for the next frame, so it never runs ahead of
+        // or behind time.
+        if (settings.detail.vsync && deltaTime < 0.2f) {
+            const float R = panelPeriod;   // the panel's own period, not exactly 1/60 s
+            stepRest += deltaTime;
+            int n = int(stepRest / R + 0.5f);
+            if (n < 1) n = 1;
+            deltaTime = float(n) * R;
+            stepRest -= deltaTime;
+            if (stepRest < -R) stepRest = -R;        // faster than the panel (no wait): bounded
+        } else {
+            stepRest = 0.0f;
+        }
+    #endif
         return true;
     }
 

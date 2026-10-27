@@ -250,6 +250,75 @@ namespace Game {
         level->saveGame(level->level.id, true, false, true); // Miyoo: the quick save's own slot
     }
 
+    // ---- Miyoo: the Game Switcher's slot (platform/bittboy/onion.h) ----
+    // saved when the game leaves for the Game Switcher or the device turns off,
+    // if it can be saved right then (as the quick save: not in the title, a
+    // cutscene, the inventory, a dying Lara...); 1 = saved and on the card
+    static void resumeWritten(Stream *stream, void *userData) {
+        if (stream) {
+            delete[] stream->data;
+            delete stream;
+        }
+    }
+
+    // every Game Switcher slot out of the list (and out of the file, if asked)
+    void resumeRemove(bool write) {
+        bool any = false;
+        for (int i = 0; i < saveSlots.length; i++)
+            if (saveSlots[i].isResume()) {
+                delete[] saveSlots[i].data;
+                saveSlots.remove(i--);
+                any = true;
+            }
+        if (any && write) {
+            int size;
+            uint8 *data = writeSaveSlots(size);
+            osWriteSlot(new Stream(SAVE_FILENAME, (const char*)data, size, resumeWritten, NULL));
+        }
+    }
+
+    bool resumeSave() {
+        if (!level || TR::isTitleLevel(level->level.id) || TR::isCutsceneLevel(level->level.id))
+            return false;
+        if (inventory->isActive() || !level->players[0] || !level->players[0]->canSaveGame() || saveResult == SAVE_RESULT_WAIT)
+            return false;
+        level->saveGame(level->level.id, true, false, 2);
+        return saveResult == SAVE_RESULT_SUCCESS;
+    }
+
+    // at the start, the game opened by OnionOS: straight into the saved place
+    // (as quickLoad(true)); the slot is then removed, so a place that would
+    // crash the game is not loaded a second time
+    bool resumeLoad() {
+        int slot = -1;
+        for (int i = 0; i < saveSlots.length; i++)
+            if (saveSlots[i].isResume()) slot = i;
+        if (!level || slot < 0)
+            return false;
+        level->loadGame(slot);
+        level->loadLevel(saveSlots[slot].getLevelID());
+        level->loadNextLevelData();
+        if (nextLevel) {
+            startLevel(nextLevel);
+            nextLevel = NULL;
+            inventory->titleTimer = 0.0f;
+        }
+        // the title had started the Core logo video: it is the inventory's (it
+        // stays from one level to the next), and it went on "playing" under the
+        // level, holding the controls but for turning and at times freezing the
+        // picture. Stopped and forgotten, with the title's other wishes.
+        if (inventory->video) {
+            delete inventory->video;
+            inventory->video = NULL;
+        }
+        inventory->playLogo  = false;
+        inventory->playVideo = false;
+        Input::reset();
+        loadSlot = -1;
+        resumeRemove(true);
+        return true;
+    }
+
     void quickLoad(bool forced = false) {
         if (!level) return;
 

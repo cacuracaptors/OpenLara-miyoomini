@@ -190,7 +190,9 @@ namespace GAPI {
         int          vCount;
         bool         dynamic;
 
-        Mesh(bool dynamic) : iBuffer(NULL), vBuffer(NULL), dynamic(dynamic) {}
+        uint8        *quadFlag;   // per vertex, for the quad it starts: 0 not known yet, 1 flat, 2 bent (see transform)
+
+        Mesh(bool dynamic) : iBuffer(NULL), vBuffer(NULL), dynamic(dynamic), quadFlag(NULL) {}
 
         void init(Index *indices, int iCount, ::Vertex *vertices, int vCount, int aCount) {
             this->iCount  = iCount;
@@ -198,6 +200,8 @@ namespace GAPI {
 
             iBuffer = new Index[iCount];
             vBuffer = new Vertex[vCount];
+            quadFlag = new uint8[vCount];
+            memset(quadFlag, 0, vCount);
 
             update(indices, iCount, vertices, vCount);
         }
@@ -205,6 +209,7 @@ namespace GAPI {
         void deinit() {
             delete[] iBuffer;
             delete[] vBuffer;
+            delete[] quadFlag;
         }
 
         void update(Index *indices, int iCount, ::Vertex *vertices, int vCount) {
@@ -214,6 +219,7 @@ namespace GAPI {
 
             if (vertices) {
                 memcpy(vBuffer, vertices, vCount * sizeof(vertices[0]));
+                if (quadFlag) memset(quadFlag, 0, this->vCount);   // new corners: worked out again
             }
         }
 
@@ -257,10 +263,12 @@ namespace GAPI {
     // Frame timing: balances the work between the two cores, and feeds the
     // periodic perf line in the log.
     long long swPerfRaster = 0, swPerfPixels = 0;
+    // a clock that only goes forward: the system's time of day can be set
+    // back (or forward) while the game runs
     static inline long long swPerfNow() {
-        timeval t;
-        gettimeofday(&t, NULL);
-        return (long long)t.tv_sec * 1000000 + t.tv_usec;
+        timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        return (long long)t.tv_sec * 1000000 + t.tv_nsec / 1000;
     }
     short4  swClipRect;
 
@@ -1611,6 +1619,27 @@ namespace GAPI {
         pU.dy = pV.dy = pQ.dy = pL.dy = 0.0f;
         PlaneSW *pl[4] = { &pU, &pV, &pQ, &pL };
 
+        // The light of a 3D quad: that of its two triangles, 0-1-2 and 0-2-3
+        // (as the level stores them), each pixel from the one it is in. Mixed
+        // from the 4 corners across each row, it changed the moment the quad
+        // was cut into triangles as it passed the camera.
+        PlaneSW lA, lB;
+        bool lightTri = !ctx.ortho && !ctx.shadow;
+        float dEx = 0.0f, dEy = 0.0f, dS1 = 0.0f;
+        if (lightTri) {
+            const float aA = (b->fx - a->fx) * (c->fy - a->fy) - (c->fx - a->fx) * (b->fy - a->fy);
+            const float aB = (c->fx - a->fx) * (d->fy - a->fy) - (d->fx - a->fx) * (c->fy - a->fy);
+            const bool okA = fabsf(aA) > 1e-3f, okB = fabsf(aB) > 1e-3f;
+            if (okA) planeSW(lA, a, b, c, float(a->l), float(b->l), float(c->l), 1.0f / aA);
+            if (okB) planeSW(lB, a, c, d, float(a->l), float(c->l), float(d->l), 1.0f / aB);
+            if (!okA && okB) lA = lB;
+            if (!okB && okA) lB = lA;
+            lightTri = okA || okB;
+            dEx = c->fx - a->fx;            // the diagonal 0-2: which side is triangle 0-1-2
+            dEy = c->fy - a->fy;
+            dS1 = dEx * (b->fy - a->fy) - dEy * (b->fx - a->fx);
+        }
+
         for (int y = firstOwned; y < y1; y++) {
             if (!ownsRowSW(ctx, y)) {
                 y = (((y >> SW_BAND_SHIFT) + 1) << SW_BAND_SHIFT) - 1;   // on to the next group
@@ -1645,6 +1674,21 @@ namespace GAPI {
                 pl[k]->dx = (ar - al) * inv;
                 pl[k]->c  = al - pl[k]->dx * xa;
             }
+            if (lightTri) {
+                // the side of the diagonal along the row: dS(x) = base - dEy * x
+                const float base = dEx * (yc - a->fy) + dEy * a->fx;
+                if (fabsf(dEy) < 1e-6f) {
+                    drawSpanSW(ctx, y, x0, x1, pU, pV, pQ, (base * dS1 >= 0.0f) ? lA : lB);
+                } else {
+                    int xs = ceilSW(base / dEy - 0.5f);
+                    if (xs < x0) xs = x0;
+                    if (xs > x1) xs = x1;
+                    const float xm = (xs > x0) ? (float(x0 + xs) * 0.5f) : (float(xs + x1) * 0.5f);
+                    const bool leftA = ((base - dEy * xm) * dS1 >= 0.0f) == (xs > x0);
+                    if (xs > x0) drawSpanSW(ctx, y, x0, xs, pU, pV, pQ, leftA ? lA : lB);
+                    if (xs < x1) drawSpanSW(ctx, y, xs, x1, pU, pV, pQ, leftA ? lB : lA);
+                }
+            } else
             drawSpanSW(ctx, y, x0, x1, pU, pV, pQ, pL);
         }
     }
@@ -2396,6 +2440,68 @@ namespace GAPI {
         return r;
     }
 
+    // Guard band. A corner right next to the camera, off to the side, lands
+    // tens of thousands of pixels off screen; its position used to be
+    // clamped to 16384 after the projection while its texture and depth were
+    // kept, which bent the texture of the whole face (walls and floors of
+    // narrow corridors swimming as Lara walks). Faces reaching past 8192
+    // pixels are now cut there, before the projection, the same way as at
+    // the near plane: the new corners get exact texture, depth and light,
+    // and nothing on screen changes but the bending.
+    #define SW_GUARD 8192.0f
+
+    // which side of plane p a corner is on (>= 0: kept). 0: the near plane;
+    // 1..4: x <= G, x >= -G, y <= G, y >= -G (pixels, times w)
+    static inline float clipDistSW(const vec4 &c, int p) {
+        switch (p) {
+            case 0:  return c.w - SW_NEAR_W;
+            case 1:  return SW_GUARD * c.w - c.x;
+            case 2:  return SW_GUARD * c.w + c.x;
+            case 3:  return SW_GUARD * c.w - c.y;
+            default: return SW_GUARD * c.w + c.y;
+        }
+    }
+
+    ClipVertexSW clipEdgePlaneSW(const ClipVertexSW &a, const ClipVertexSW &b, int p) {
+        const double da = clipDistSW(a.c, p), db = clipDistSW(b.c, p);
+        const double t = da / (da - db);
+        ClipVertexSW r;
+        r.c.x = float(a.c.x + (b.c.x - a.c.x) * t);
+        r.c.y = float(a.c.y + (b.c.y - a.c.y) * t);
+        r.c.z = float(a.c.z + (b.c.z - a.c.z) * t);
+        r.c.w = float(a.c.w + (b.c.w - a.c.w) * t);
+        if (p == 0) r.c.w = SW_NEAR_W;
+        r.u = lerpFixedSW(a.u, b.u, t);
+        r.v = lerpFixedSW(a.v, b.v, t);
+        // the light goes straight across the screen (not in perspective): at a
+        // guard band cut it is taken where the edge crosses it on the screen,
+        // so the cut face keeps its light exactly
+        const double s = (p == 0) ? t : t * double(b.c.w) / (double(a.c.w) + t * (double(b.c.w) - double(a.c.w)));
+        r.l = lerpFixedSW(a.l, b.l, s);
+        r.color = a.color;
+        return r;
+    }
+
+    // Sutherland-Hodgman against plane p: n corners in, the count out
+    static int clipPolyPlaneSW(const ClipVertexSW *in, int n, ClipVertexSW *out, int p) {
+        int count = 0;
+        for (int k = 0; k < n; k++) {
+            const ClipVertexSW &a = in[k];
+            const ClipVertexSW &b = in[(k + 1) % n];
+            const bool aIn = clipDistSW(a.c, p) >= 0.0f;
+            const bool bIn = clipDistSW(b.c, p) >= 0.0f;
+            if (aIn) out[count++] = a;
+            if (aIn != bIn) out[count++] = clipEdgePlaneSW(a, b, p);
+        }
+        return count;
+    }
+
+    // a corner in front of the near plane that would land past the guard band
+    static inline bool pastGuardSW(const vec4 &c) {
+        const float g = SW_GUARD * c.w;
+        return c.x > g || c.x < -g || c.y > g || c.y < -g;
+    }
+
     // This rasterizer maps textures affinely (u/v interpolated linearly in
     // screen space, like the PS1), which warps them badly on polygons whose
     // depth varies a lot across them: walls right next to the camera, or the
@@ -2468,6 +2574,96 @@ namespace GAPI {
         }
     }
 
+    // A quad drawn whole takes its texture straight across each row from one
+    // side to the other. On a flat face with a texture laid flat on it (most
+    // walls) that is exact, and the same as its two triangles. But some
+    // quads are bent, or have their texture stretched unevenly (a trapezoid
+    // of the texture page on a square face): whole, their texture depends on
+    // how the quad lies on screen, and it jumped when a corner went behind
+    // the camera or off the side and the quad was cut into triangles. Those
+    // are always drawn as the same two triangles, 0-1-2 and 0-2-3 (as the
+    // level stores them), whole or cut: no jump.
+    static inline bool quadFlatTextureSW(const float p[4][3], const float t[4][2]) {
+        float e1[3], e2[3], d[3];
+        for (int i = 0; i < 3; i++) {
+            e1[i] = p[1][i] - p[0][i];
+            e2[i] = p[2][i] - p[0][i];
+            d[i]  = p[3][i] - p[0][i];
+        }
+        // corner 3 = corner 0 + s * e1 + r * e2 (+ off the plane)
+        const float a = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+        const float b = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+        const float c = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+        const float f = e1[0] * d[0]  + e1[1] * d[1]  + e1[2] * d[2];
+        const float g = e2[0] * d[0]  + e2[1] * d[1]  + e2[2] * d[2];
+        const float det = a * c - b * b;
+        if (det <= 1e-3f * a * c) return false;   // degenerate: as triangles
+        const float s = (f * c - g * b) / det;
+        const float r = (g * a - f * b) / det;
+        float off2 = 0.0f;
+        for (int i = 0; i < 3; i++) {
+            const float o = d[i] - s * e1[i] - r * e2[i];
+            off2 += o * o;
+        }
+        if (off2 > 4.0f) return false;            // bent by more than 2 units (a sector is 1024)
+        for (int i = 0; i < 2; i++) {             // the texture at corner 3, within a quarter texel
+            const float o = t[3][i] - t[0][i] - s * (t[1][i] - t[0][i]) - r * (t[2][i] - t[0][i]);
+            if (o > 0.25f || o < -0.25f) return false;
+        }
+        return true;
+    }
+
+    // a polygon of the batch: clipped at the near plane and the guard band if
+    // it has to be, projected and recorded
+    void emitClippedSW(const ClipVertexSW *poly, int n) {
+        bool allFront = true, allBehind = true, pastGuard = false;
+        for (int k = 0; k < n; k++) {
+            const bool isOrtho = (poly[k].c.w == 1.0f);
+            if (poly[k].c.w < SW_NEAR_W && !isOrtho) allFront = false; else allBehind = false;
+            if (!isOrtho && pastGuardSW(poly[k].c)) pastGuard = true;
+        }
+        if (allBehind) return;
+
+        if (allFront && !pastGuard) {
+            int32 first = swIndices.length;
+            for (int k = 0; k < n; k++) {
+                swIndices.push(projectVertexSW(poly[k]));
+            }
+            if (n == 3) {
+                swTriangles.push(first);
+            } else {
+                swQuads.push(first);
+            }
+            return;
+        }
+
+        // crosses the near plane or reaches past the guard band:
+        // Sutherland-Hodgman against w = SW_NEAR_W, then the guard band
+        // (each plane adds at most one corner: 4 + 5 = 9)
+        ClipVertexSW bufA[12], bufB[12];
+        ClipVertexSW *clipped = bufA, *spare = bufB;
+        int count = n;
+        for (int k = 0; k < n; k++) bufA[k] = poly[k];
+        if (!allFront) count = clipPolyPlaneSW(poly, n, clipped, 0);
+        bool guard = pastGuard;
+        if (!guard)      // corners made at the near plane can land past it too
+            for (int k = 0; k < count; k++) if (pastGuardSW(clipped[k].c)) { guard = true; break; }
+        if (guard) {
+            for (int p = 1; p <= 4 && count >= 3; p++) {
+                count = clipPolyPlaneSW(clipped, count, spare, p);
+                ClipVertexSW *t = clipped; clipped = spare; spare = t;
+            }
+        }
+        if (count < 3) return;
+
+        for (int k = 1; k + 1 < count; k++) {
+            ClipVertexSW tri[3] = { clipped[0], clipped[k], clipped[k + 1] };
+            emitPolygonSW(tri, 3, 0);
+        }
+    }
+
+    static uint8 *swQuadFlag = NULL;   // the batch's mesh's quadFlag (set by DIP)
+
     bool transform(const Index *indices, const Vertex *vertices, int iStart, int iCount, int vStart) {
         // What is in the water is tinted and shimmers even seen from dry
         // land, as in the DOS game; with the camera underwater, everything.
@@ -2508,14 +2704,16 @@ namespace GAPI {
 
             ClipVertexSW poly[4];
             bool tooFar    = false;
-            bool allFront  = true;
             bool allBehind = true;
+            float qp[4][3], qt[4][2];   // the quad's corners and texture, as the level has them
 
             for (int k = 0; k < n; k++) {
                 const Vertex &vertex = vertices[vStart + indices[iStart + pos[k]]];
                 ClipVertexSW &cv = poly[k];
                 {
                 cv.c = swMatrix * vec4(vertex.coord.x, vertex.coord.y, vertex.coord.z, 1.0f);
+                qp[k][0] = float(vertex.coord.x); qp[k][1] = float(vertex.coord.y); qp[k][2] = float(vertex.coord.z);
+                qt[k][0] = float(vertex.texCoord.x); qt[k][1] = float(vertex.texCoord.y);
 
                 // Underwater, as the DOS game did it: vertices sway a little and
                 // the light shimmers in slow waves. 2D batches (w == 1) are
@@ -2567,40 +2765,33 @@ namespace GAPI {
                 // behind the camera and must not be near-clipped.
                 const bool isOrtho = (cv.c.w == 1.0f);
                 if (!isOrtho) swOrthoBatch = false;
-                if (cv.c.w < SW_NEAR_W && !isOrtho) allFront = false; else allBehind = false;
+                if (!(cv.c.w < SW_NEAR_W && !isOrtho)) allBehind = false;
             }
 
             if (tooFar || allBehind) continue;
 
-            if (allFront) {
-                int32 first = swIndices.length;
-                for (int k = 0; k < n; k++) {
-                    swIndices.push(projectVertexSW(poly[k]));
-                }
-                if (n == 3) {
-                    swTriangles.push(first);
+            // bent or not: worked out the first time the quad is drawn and kept
+            // with its mesh (the corners only change when the mesh is rebuilt)
+            bool bent = false;
+            if (n == 4 && !colored && poly[0].c.w != 1.0f) {
+                uint8 *fl = swQuadFlag ? swQuadFlag + vStart + indices[iStart + pos[0]] : NULL;
+                if (fl && *fl) {
+                    bent = *fl == 2;
                 } else {
-                    swQuads.push(first);
+                    bent = !quadFlatTextureSW(qp, qt);
+                    if (fl) *fl = bent ? 2 : 1;
                 }
-                continue;
             }
-
-            // crosses the near plane: Sutherland-Hodgman against w = SW_NEAR_W
-            ClipVertexSW clipped[5];
-            int count = 0;
-            for (int k = 0; k < n; k++) {
-                const ClipVertexSW &a = poly[k];
-                const ClipVertexSW &b = poly[(k + 1) % n];
-                bool aIn = a.c.w >= SW_NEAR_W;
-                bool bIn = b.c.w >= SW_NEAR_W;
-                if (aIn) clipped[count++] = a;
-                if (aIn != bIn) clipped[count++] = clipEdgeSW(a, b);
-            }
-            if (count < 3) continue;
-
-            for (int k = 1; k + 1 < count; k++) {
-                ClipVertexSW tri[3] = { clipped[0], clipped[k], clipped[k + 1] };
-                emitPolygonSW(tri, 3, 0);
+            if (!bent && n == 4 && !colored && poly[0].c.w != 1.0f)
+                for (int k = 0; k < 4; k++)
+                    if (poly[k].c.w < SW_NEAR_W || pastGuardSW(poly[k].c)) { bent = true; break; }   // cut: as its two triangles
+            if (bent) {
+                const ClipVertexSW t0[3] = { poly[0], poly[1], poly[2] };
+                const ClipVertexSW t1[3] = { poly[0], poly[2], poly[3] };
+                emitClippedSW(t0, 3);
+                emitClippedSW(t1, 3);
+            } else {
+                emitClippedSW(poly, n);
             }
         }
 
@@ -2620,7 +2811,9 @@ namespace GAPI {
 
         transformLights();
 
+        swQuadFlag = mesh->quadFlag;
         bool colored = transform(mesh->iBuffer, mesh->vBuffer, range.iStart, range.iCount, range.vStart);
+        swQuadFlag = NULL;
 
         const bool oldDepthTest  = swDepthTest;
         const bool oldDepthWrite = swDepthWrite;

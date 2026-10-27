@@ -365,8 +365,8 @@ struct Inventory {
                 if (TR::getGameVersionByLevel(id) != (level->version & TR::VER_VERSION))
                     continue;
 
-                if (slot.isQuick()) // Miyoo: the quick save is loaded only with Menu+L1
-                    continue;
+                if (slot.isQuick() || slot.isResume()) // Miyoo: the quick save is loaded only with Menu+L1,
+                    continue;                           // the Game Switcher's only when OnionOS opens the game
 
                 OptionItem item;
                 item.type   = OptionItem::TYPE_BUTTON;

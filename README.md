@@ -26,6 +26,7 @@ rebuilt for it: precise, perspective-correct and spread over both CPU cores. Thi
 - Music with the GOG file names, as they come (no renaming), including the cutscene audio
 - A full PS1-style control scheme adapted to the Miyoo Mini Plus buttons
 - Save anywhere from the passport (Save Game), as in the PC game, plus a separate quick save slot
+- Game Switcher and power-off saves: the game continues where you left it, with its screenshot in the Game Switcher
 - An in-game help screen listing the Miyoo Mini Plus buttons
 - Set Controls with the Miyoo Mini Plus button names (the L2/R2 sidesteps follow the Walk and Left/Right buttons)
 - Lara's Home narration, as in the PC game
@@ -70,12 +71,24 @@ folder instead of `GAME.GOG`.
 | Select | Show / hide the help screen |
 | Menu + R1 | Quick save |
 | Menu + L1 | Quick load |
+| Menu | Game Switcher / OnionOS menu (see below) |
 
 To save, open the passport in the inventory and choose "Save Game?" (its "Current Position" is on the Load Game page). The quick save
 (Menu + R1) has its own slot: it is loaded only with Menu + L1 and does not show up on the Load Game page, so
 the two never overwrite each other. The buttons can be changed in the controls options (the gamepad in the
-inventory); the menus always use Y to select and A to go back. To exit, choose "Exit to Title" and then "Exit Game". The Menu key alone does nothing,
-so the OnionOS Menu+Power screenshot combo is safe to use at any time.
+inventory); the menus always use Y to select and A to go back.
+
+### Menu button, Game Switcher and power off
+
+The Menu button does what it is set to do in OnionOS (the Menu button options in the Tweaks app): by default,
+a tap opens the Game Switcher and holding it goes back to the OnionOS menu; a double tap can switch to the
+previous game. Leaving the game this way, or turning the console off with the power button, saves your
+position in a slot of its own, and the next time the game opens (from the Game Switcher, or by itself when the
+console is turned on again) it continues from there; hold Menu while turning the console on to skip that, as
+with any OnionOS game. On the title screen, in the menus and during cutscenes and videos there is nothing to
+save, so the game starts again from the title. Menu pressed together with another button (Menu + R1, Menu + L1,
+the OnionOS Menu + Power screenshot) does none of this. The game can also be closed from the passport: "Exit
+to Title" and then "Exit Game".
 
 ## Cheats
 
@@ -100,6 +113,7 @@ They don't work in Lara's Home, in cutscenes or on the title screen.
 
 ## Changelog
 
+- **v1.2.0** - OnionOS integration: the Menu button works as set for it in OnionOS (Game Switcher, back to the menu, previous game), the Game Switcher shows the game's screenshot and the game continues where it was left, and turning the console off saves the position and continues from it when the console is turned on again. Wall textures no longer jump as they pass the edges of the screen (faces that are not flat are always drawn as two triangles), and the lighting no longer pops there either. Smoother motion: the game steps with the panel's real refresh rate (just under 60 Hz), measured while it runs. Loading a save in the drained channel of the Lost Valley rapids no longer leaves Lara stuck turning in place (the flipped rooms are set before Lara, as in the original). The game no longer freezes when opened from the Game Switcher, and buttons pressed before it opened no longer stay held. At start the screen is set to 640x480 with vsync whatever mode the previous program left, and a change of the system time no longer freezes the game.
 - **v1.1.0** - Textures no longer bend (warp) when the camera is right up against a wall or floor: where the perspective steps would be off by more than half a texel, they are taken more often; everywhere else the image is the same as before, at almost the same speed.
 - **v1.0.9** - Dynamic resolution: only in the heaviest moments, the 3D is drawn a step smaller (576x432 or 512x384) and the chip's 2D engine scales it back to 640x480, smoothing it, to keep the frame rate; it goes back to 640x480 as soon as there is room again, and menus, the inventory and videos always stay at 640x480. Plants and rocks no longer lose parts as the camera turns: like in the original game, a room seen through a doorway is drawn whole, not cut to the doorway (only rooms that share space with another one still are), and a plant or rock that leans into the next room is drawn with that room too, so it no longer vanishes when only that room is in view (as TRX does). The see-through parts of plants and fences cost less to draw (the same image).
 - **v1.0.8** - Faster drawing, about 25% over v1.0.7 with the same look: quads are drawn whole as in the original game, faces hidden behind what is already on screen are skipped, and the pixel loop is shorter; most noticeable in large open areas and underwater. The waterfall splashes (and the other effects: smoke, blood, sparks, bubbles) no longer flicker between dark and tinted: they are drawn at the original game's neutral brightness.
@@ -147,7 +161,10 @@ and `OpenLara-sw` (stripped: the one shipped as `OpenLara` in the release). The 
   with translucency, and the per-room underwater palette and light shimmer
 - **`src/level.h`**, **`src/controller.h`** - effect sprites placed correctly in fixed-function renderers,
   per-room water palette, sky backdrop for the software renderer
-- **`src/savegame.h`**, **`src/game.h`** - separate save slots for the quick save and the passport's Save Game
+- **`src/savegame.h`**, **`src/game.h`** - separate save slots for the quick save and the passport's Save Game,
+  and the hidden slot the game continues from after the Game Switcher or a power off
+- **`src/lara.h`** - after a save is loaded, Lara's state (on land, swimming) follows the flipped rooms, as in
+  the original
 - **`src/lang.h`** - the help screen text and the gamepad button names of the Miyoo Mini Plus
 - **`src/gameflow.h`** - TR1 music mapped onto the 9 PC CD tracks, GOG file names accepted
 - **`src/sound.h`** - MP3/OGG decoder fixes (buffered PCM, stereo output)
@@ -155,7 +172,8 @@ and `OpenLara-sw` (stripped: the one shipped as `OpenLara` in the release). The 
   lookup, video frames, palette handling and fixes for later games' data
 - **`src/platform/bittboy/`** - the Miyoo Mini platform: SDL 1.2 video with the 180-degree panel rotation,
   MI_AO audio, controls, crash handler (`crash_handler.cc`), first-run extraction of `DATA`/`FMV` from the
-  GOG CD image with a progress screen (`cdextract.h`), and the build script
+  GOG CD image with a progress screen (`cdextract.h`), the OnionOS integration (`onion.h`: the Menu button
+  actions, the Game Switcher image, the save at power off) and the build script
 
 ## Credits
 

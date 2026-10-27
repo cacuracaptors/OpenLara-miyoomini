@@ -733,6 +733,12 @@ struct Lara : Character {
         if (itemHolster != TR::Entity::NONE)
             meshSwap(1, level->extra.weapons[itemHolster], JOINT_MASK_LEG_L1 | JOINT_MASK_LEG_R1);
 
+        updateStandFromRoom();
+    }
+
+    // in the air, on the water or under it, as her room is now (also once a
+    // loaded game has flipped its rooms: Level::parseSaveSlot)
+    void updateStandFromRoom() {
         if (getRoom().flags.water) {
             stand = STAND_UNDERWATER;
             if (state == STATE_SURF_TREAD || state == STATE_SURF_SWIM || state == STATE_SURF_BACK || state == STATE_SURF_LEFT || state == STATE_SURF_RIGHT)

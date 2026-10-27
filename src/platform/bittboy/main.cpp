@@ -36,10 +36,14 @@ SDL_Surface *screen = NULL;
 // timing
 unsigned int startTime;
 
+// The game's clock: one that only goes forward (CLOCK_MONOTONIC). With the time
+// of day, a change of the system's time while the game ran (set back when
+// OnionOS opened it again from the Game Switcher) left the game standing still,
+// its picture frozen, until the time of day caught up.
 int osGetTimeMS() {
-    timeval t;
-    gettimeofday(&t, NULL);
-    return int((t.tv_sec - startTime) * 1000 + t.tv_usec / 1000);
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return int((t.tv_sec - startTime) * 1000 + t.tv_nsec / 1000000);
 }
 
 // sound
@@ -423,6 +427,11 @@ static void miyooUpdateShared() {
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/fb.h>
+#include <errno.h>
+#include <string.h>
+#include <signal.h>
+#include <linux/vt.h>
+#include <linux/kd.h>
 
 static int               fbFd    = -1;
 static fb_var_screeninfo fbVar;
@@ -440,7 +449,49 @@ static void fbRestore() {
     }
 }
 
+// The screen mode the previous program left. On the Mini v4 and the Flip,
+// OnionOS can leave the screen at 752x560; and a single page (virtual
+// 640x480, as SDL leaves it when a menu without double buffering closes)
+// means no vsync: the picture tears as the camera turns. Either one is put
+// back to 640x480, 32 bpp, two pages (virtual 640x960), the way OnionOS
+// itself sets it (fbset -g 640 480 640 960 32); two or three pages at
+// 640x480 are left as they are. Once, at the start: it costs nothing later.
+static void fbFixMode(const char *when, bool force = false) {
+    int fd = open("/dev/fb0", O_RDWR);
+    if (fd < 0) return;
+    fb_var_screeninfo v;
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &v) == 0 &&
+        (force || v.xres != SCREEN_WIDTH || v.yres != SCREEN_HEIGHT || v.bits_per_pixel != 32 ||
+         v.yres_virtual < (unsigned)SCREEN_HEIGHT * 2)) {
+        // forced (at the start): the same mode set again even when it looks
+        // right, so the game always starts from a known mode; three pages, if
+        // there were, are kept (the game draws straight into them)
+        const bool good = v.xres == SCREEN_WIDTH && v.yres == SCREEN_HEIGHT && v.bits_per_pixel == 32;
+        fb_var_screeninfo n = v;
+        n.xres = n.xres_virtual = SCREEN_WIDTH;
+        n.yres = SCREEN_HEIGHT;
+        n.yres_virtual = (good && v.yres_virtual >= (unsigned)SCREEN_HEIGHT * 3) ? SCREEN_HEIGHT * 3 : SCREEN_HEIGHT * 2;
+        n.xoffset = n.yoffset = 0;
+        n.activate = FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+        if (v.bits_per_pixel != 32) {
+            n.bits_per_pixel = 32;
+            n.red.offset    = 16; n.red.length    = 8;
+            n.green.offset  = 8;  n.green.length  = 8;
+            n.blue.offset   = 0;  n.blue.length   = 8;
+            n.transp.offset = 24; n.transp.length = 8;
+        }
+        int r = ioctl(fd, FBIOPUT_VSCREENINFO, &n);
+        fprintf(stderr, "screen (%s): %ux%u %ubpp (virtual %u lines, page at %u), to 640x480 with %u pages: %s\n",
+                when, v.xres, v.yres, v.bits_per_pixel, v.yres_virtual, v.yoffset, n.yres_virtual / SCREEN_HEIGHT,
+                r == 0 ? "ok" : strerror(errno));
+        if (r == 0)   // OnionOS tells batmon and keymon after every mode change (they draw on the screen)
+            system("killall -SIGUSR1 batmon >/dev/null 2>&1; killall -SIGUSR1 keymon >/dev/null 2>&1");
+    }
+    close(fd);
+}
+
 static void fbInit() {
+    fbFixMode("after SDL");   // the mode as SDL left it; read again below
     fbFd = open("/dev/fb0", O_RDWR);
     if (fbFd < 0) { fprintf(stderr, "vsync: off (no /dev/fb0)\n"); return; }
     fb_fix_screeninfo fix;
@@ -684,6 +735,22 @@ static void* flipProc(void *arg) {
             fbVar.yoffset = page * SCREEN_HEIGHT;
             ioctl(fbFd, FBIOPAN_DISPLAY, &fbVar);   // shows it at the next vsync, and waits for it
             fbPage = page;
+            // the panel's period, from the flips one refresh apart (the game's
+            // steps: Core::update)
+            {
+                static long long lastPan = 0;
+                static double period = 16666.7;
+                static int samples = 0;
+                const long long now = GAPI::swPerfNow();
+                const long long d = now - lastPan;
+                if (lastPan && d > 15000 && d < 18500) {
+                    period += (double(d) - period) * 0.02;
+                    Core::panelPeriod = float(period / 1000000.0);
+                    if (++samples == 600)
+                        fprintf(stderr, "tela: periodo medido %.3f ms (%.2f Hz)\n", period / 1000.0, 1000000.0 / period);
+                }
+                lastPan = now;
+            }
         } else {
         if (SDL_MUSTLOCK(flipScreen)) SDL_LockSurface(flipScreen);
         if (flipScreen->pitch == SCREEN_WIDTH * 4) {
@@ -739,6 +806,92 @@ static void rasterWaitsForFlip() {
 }
 
 #include "cdextract.h"   // first run: copy DATA/FMV out of GAME.GOG
+#include "onion.h"       // OnionOS: the Game Switcher and the save at power-off
+
+// The keys of the first half second after the game opens are left over from
+// before it (pressed in the Game Switcher or the menus, waiting in the
+// console's keyboard): a press whose release never came left a button held
+// (L1, look: the D-pad then turned the camera around a standing Lara). They
+// are dropped, and then every button's state is cleared.
+static bool staleKeys() {
+    static long long t0 = 0;
+    static bool done = false;
+    if (done) return false;
+    const long long now = GAPI::swPerfNow();
+    if (!t0) t0 = now;
+    if (now - t0 < 500000) return true;
+    done = true;
+    memset(miyooHeld, 0, sizeof(miyooHeld));
+    miyooL2 = miyooR2 = miyooMenu = miyooQuickSave = miyooQuickLoad = false;
+    Input::reset();
+    miyooUpdateShared();
+    return false;
+}
+
+// The console (virtual terminal). SDL's fbcon driver, opening the screen, takes a
+// free terminal and waits, with no time limit, for the kernel to make it the
+// active one. The kernel refuses to switch, without saying so, while the active
+// terminal is in graphics mode or switching is locked, which a program that
+// closed without putting them back leaves behind (seen when OpenLara opened from
+// the Game Switcher: the game stood still before its first frame until the
+// power-off signal broke the wait). So the active terminal goes back to text
+// mode and the lock is lifted before SDL opens the screen.
+static void consoleUnstick() {
+    const int fd0 = open("/dev/tty0", O_RDWR);
+    if (fd0 < 0) {
+        fprintf(stderr, "console: sem /dev/tty0 (%s)\n", strerror(errno));
+        return;
+    }
+    vt_stat st;
+    memset(&st, 0, sizeof(st));
+    int freeVt = -1;
+    ioctl(fd0, VT_OPENQRY, &freeVt);
+    if (ioctl(fd0, VT_GETSTATE, &st) == 0 && st.v_active > 0) {
+        char path[32];
+        snprintf(path, sizeof(path), "/dev/tty%d", int(st.v_active));
+        const int fd = open(path, O_RDWR);
+        int kd = -1;
+        vt_mode m;
+        memset(&m, 0, sizeof(m));
+        if (fd >= 0) {
+            ioctl(fd, KDGETMODE, &kd);
+            ioctl(fd, VT_GETMODE, &m);
+        }
+        fprintf(stderr, "console: ativo tty%d (%s, troca %s), livre tty%d\n", int(st.v_active),
+                kd == KD_GRAPHICS ? "modo grafico" : kd == KD_TEXT ? "modo texto" : "modo ?",
+                m.mode == VT_PROCESS ? "feita por um programa" : "automatica", freeVt);
+        if (fd >= 0 && kd == KD_GRAPHICS) {
+            const int r = ioctl(fd, KDSETMODE, KD_TEXT);
+            fprintf(stderr, "console: tty%d de volta ao modo texto: %s\n", int(st.v_active), r == 0 ? "ok" : strerror(errno));
+        }
+        if (fd >= 0 && m.mode == VT_PROCESS) {
+            vt_mode a;
+            memset(&a, 0, sizeof(a));
+            a.mode = VT_AUTO;
+            const int r = ioctl(fd, VT_SETMODE, &a);
+            fprintf(stderr, "console: tty%d com troca automatica: %s\n", int(st.v_active), r == 0 ? "ok" : strerror(errno));
+        }
+        if (fd >= 0) close(fd);
+    }
+    ioctl(fd0, VT_UNLOCKSWITCH, 1);
+    close(fd0);
+}
+
+// If SDL still waits, a watcher interrupts the wait (a signal that does nothing,
+// as the power-off signal did): from 2 s on, once a second, for at most 10 s.
+static volatile int consoleDone, consoleKicks;
+static pthread_t    consoleMain;
+static void consoleKickHandler(int) {}
+static void* consoleWatcher(void *) {
+    for (int i = 0; i < 24 && !consoleDone; i++) {
+        usleep(500000);
+        if (!consoleDone && i >= 3 && (i & 1)) {
+            consoleKicks++;
+            pthread_kill(consoleMain, SIGRTMIN + 5);
+        }
+    }
+    return NULL;
+}
 
 int main() {
     fallout::installCrashHandler();
@@ -753,8 +906,24 @@ int main() {
         }
     }
 
+    setvbuf(stdout, NULL, _IOLBF, 0);   // the log line by line (the game can be stopped at power-off)
+    fbFixMode("start", true); // before anything opens the screen: always set again
+    Onion::init();            // how OnionOS opened the game (Game Switcher, power-off, list)
+
     // GOG/Steam Tomb Raider 1: DATA and FMV live inside the GAME.GOG CD image
     CDExtract::extractGameFiles();
+
+    consoleUnstick();
+    pthread_t consoleW;
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = consoleKickHandler;   // no SA_RESTART: the wait ends
+        sigaction(SIGRTMIN + 5, &sa, NULL);
+        consoleMain = pthread_self();
+        pthread_create(&consoleW, NULL, consoleWatcher, NULL);
+    }
+    const long long tSdl = GAPI::swPerfNow();
     SDL_Init(SDL_INIT_VIDEO | SDL_INIT_NOPARACHUTE);
     SDL_ShowCursor(0);
     // Miyoo Mini: the panel's framebuffer is 32bpp. Asking SDL for 16bpp is
@@ -763,6 +932,15 @@ int main() {
     // format and convert ourselves: the rasterizer keeps writing 16-bit
     // pixels (what it is fast at) into our buffer, widened once per frame.
     screen = SDL_SetVideoMode(SCREEN_WIDTH, SCREEN_HEIGHT, 32, SDL_HWSURFACE | SDL_NOFRAME);
+    consoleDone = 1;
+    pthread_join(consoleW, NULL);
+    {
+        const int ms = int((GAPI::swPerfNow() - tSdl) / 1000);
+        if (consoleKicks || ms > 1000)
+            fprintf(stderr, "console: o SDL so abriu a tela em %d ms (%d avisos para destravar)\n", ms, int(consoleKicks));
+        else
+            fprintf(stderr, "console: tela aberta pelo SDL em %d ms\n", ms);
+    }
     fprintf(stderr, "screen: %s%s pitch=%d\n",
         (screen->flags & SDL_HWSURFACE) ? "hardware" : "software",
         (screen->flags & SDL_DOUBLEBUF) ? " double-buffered" : "", screen->pitch);
@@ -776,8 +954,8 @@ int main() {
     GAPI::swPresent = presentFrame;
     swBuffer = new uint16[SCREEN_WIDTH * SCREEN_HEIGHT];
 
-    timeval t;
-    gettimeofday(&t, NULL);
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
     startTime = t.tv_sec;
 
     Core::width  = SCREEN_WIDTH;
@@ -794,14 +972,28 @@ int main() {
 
     sndInit();
 
+    Onion::start();   // opened from the Game Switcher / after a power-off: straight back to the game
+
     bool isQuit = false;
 
     // The core asks to quit by setting Core::isQuit (passport -> Exit Game),
     // which this loop never checked, so that option did nothing.
     while (!isQuit && !Core::isQuit) {
 
+        // Every event waiting is handled, then a frame is done. Before, an event
+        // took the place of the frame: with a steady stream of them the game
+        // never drew, its picture frozen. (At most 64 at a time: the game
+        // always gets its frame.)
+        staleKeys();   // (the half second starts with the loop)
         SDL_Event event;
-        if (SDL_PollEvent(&event)) {
+        int events = 0;
+        while (events < 64 && SDL_PollEvent(&event)) {
+            events++;
+            if ((event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) && staleKeys()) {
+                fprintf(stderr, "teclas: %s %d ignorada (sobra de antes do jogo abrir)\n",
+                        event.type == SDL_KEYDOWN ? "apertada" : "solta", int(event.key.keysym.sym));
+                continue;
+            }
 
             if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
                 const bool down = (event.type == SDL_KEYDOWN);
@@ -851,7 +1043,8 @@ int main() {
                     }
                 }
             }
-        } else {
+        }
+        {
             if (Game::update()) {
                 Game::render();
                 // Rasterize the recorded frame on both cores; each core then
@@ -886,11 +1079,13 @@ int main() {
                         last = now;
                     }
                 }
+                Onion::frame();   // MENU (Game Switcher...) and power-off, between frames
             }
         }
 
     }
 
+    Onion::end();
     Game::deinit();
 
     sndFree();

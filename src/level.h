@@ -136,7 +136,7 @@ struct Level : IGame {
         inventory->toggle(playerIndex, Inventory::Page(page));
     }
 
-    SaveSlot createSaveSlot(TR::LevelID id, bool checkpoint, bool dummy = false, bool quick = false) {
+    SaveSlot createSaveSlot(TR::LevelID id, bool checkpoint, bool dummy = false, int quick = 0) {   // quick: the checkpoint's kind
         SaveSlot slot;
 
         // allocate oversized data for save slot
@@ -153,7 +153,8 @@ struct Level : IGame {
             *stats = saveStats;
         stats->level      = id;
         stats->checkpoint = checkpoint;
-        stats->quick      = checkpoint && quick;
+        stats->quick      = checkpoint && quick == 1;
+        stats->resume     = checkpoint && quick == 2;
         ptr += sizeof(*stats);
 
     // inventory items
@@ -278,6 +279,13 @@ struct Level : IGame {
             if (level.state.flags.flipped) {
                 flipMap();
                 level.state.flags.flipped = true;
+                // Lara was set up in her room as it was before the flip (the
+                // drained channel of Lost Valley still full: under water on its
+                // dry floor, stuck there, her air running out). TRX loads the
+                // flipped rooms before the items for the same reason.
+                for (int i = 0; i < 2; i++)
+                    if (players[i] && !level.isHome())
+                        players[i]->updateStandFromRoom();
             }
 
             uint8 track = level.state.flags.track;
@@ -300,7 +308,7 @@ struct Level : IGame {
         }
     }
 
-    virtual void saveGame(TR::LevelID id, bool checkpoint, bool updateStats, bool quick = false) {
+    virtual void saveGame(TR::LevelID id, bool checkpoint, bool updateStats, int quick = 0) {   // quick: the checkpoint's kind
         ASSERT(saveResult != SAVE_RESULT_WAIT);
 
         if (saveResult == SAVE_RESULT_WAIT)
@@ -323,7 +331,7 @@ struct Level : IGame {
         } else {
             // a checkpoint replaces only its own kind (quick save or passport);
             // a level save removes both, as before
-            removeSaveSlot(id, checkpoint, checkpoint ? int(quick) : -1);
+            removeSaveSlot(id, checkpoint, checkpoint ? quick : -1);
             saveSlots.push(createSaveSlot(id, checkpoint, false, quick));
         }
 
