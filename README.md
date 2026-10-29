@@ -188,3 +188,7 @@ and `OpenLara-sw` (stripped: the one shipped as `OpenLara` in the release). The 
 
 OpenLara is distributed under the BSD 2-Clause License (see [LICENSE](LICENSE)). Tomb Raider and Lara Croft
 are trademarks of their respective owners; no game data is included - you need your own copy of the game.
+
+## AI-Assisted
+
+Claude Opus 5.5 was used to write parts of the code and to speed up debugging and optimization.
