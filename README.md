@@ -186,8 +186,17 @@ and `OpenLara-sw` (stripped: the one shipped as `OpenLara` in the release). The 
 
 ## License
 
-OpenLara is distributed under the BSD 2-Clause License (see [LICENSE](LICENSE)). Tomb Raider and Lara Croft
-are trademarks of their respective owners; no game data is included - you need your own copy of the game.
+OpenLara is distributed under the BSD 2-Clause License (see [LICENSE](LICENSE)).
+
+The code written for this port is also available under the MIT License (see `LICENSE-MIT`): the files written from
+scratch for the Miyoo Mini (`src/platform/bittboy/onion.h`, `src/platform/bittboy/cdextract.h`,
+`src/platform/bittboy/build_miyoomini.sh`) and the changes made for the Miyoo Mini in OpenLara's own files (the
+software renderer, `src/platform/bittboy/main.cpp` and the rest). Those files as a whole keep OpenLara's BSD 2-Clause
+License and its copyright notice. The setup screen font in `cdextract.h` is rendered from DejaVu Sans Mono
+(Bitstream Vera / DejaVu font license).
+
+Tomb Raider and Lara Croft are trademarks of their respective owners; no game data is included - you need your own
+copy of the game.
 
 ## AI-Assisted
 
